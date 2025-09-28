@@ -1,3 +1,6 @@
+--// FIX: This file contains Roblox Lua code, but has a .tsx file extension, which causes TypeScript to try and parse it, resulting in thousands of errors.
+	--// Adding `// @ts-nocheck` to instruct the TypeScript compiler to ignore this file, resolving the issue without changing the underlying code.
+	--// @ts-nocheck
 -- File: StarterPlayer/StarterPlayerScripts/HUD.client.lua
 -- Minimal first-iteration HUD + Minimap + Shared Timer
 -- Disables Roblox CoreGui (except proximity prompts), shows Bits, Hearts, Minimap, Timer, and CC health
@@ -13,6 +16,10 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 local RE_SharedTimerSync = Remotes:WaitForChild("RE_SharedTimerSync")
 local RE_Minimap_Snapshot = Remotes:FindFirstChild("RE_Minimap_Snapshot")
 local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+-- For the new minimap logic
+local mapBoundsMin, mapBoundsMax = nil, nil
+local mapPadding = 20 -- world units padding
 
 -- Disable all core Roblox UI (prompts unaffected)
 pcall(function()
@@ -68,6 +75,7 @@ mini.Size = UDim2.new(0, 240, 0, 120)
 mini.Position = UDim2.new(0.5, -120, 0, 10)
 mini.BackgroundColor3 = Color3.fromRGB(15,15,20)
 mini.BackgroundTransparency = 0.2
+mini.ClipsDescendants = true
 local mmStroke = Instance.new("UIStroke", mini)
 mmStroke.Color = Color3.fromRGB(60,60,70)
 mmStroke.Thickness = 2
@@ -84,9 +92,9 @@ miniCanvas.Parent = mini
 -- Latest minimap snapshot from server
 local latestSnapshot = nil
 if RE_Minimap_Snapshot then
-    RE_Minimap_Snapshot.OnClientEvent:Connect(function(payload)
-        latestSnapshot = payload
-    end)
+	RE_Minimap_Snapshot.OnClientEvent:Connect(function(payload)
+		latestSnapshot = payload
+	end)
 end
 
 -- Bottom middle: Shared Timer + CC health
@@ -217,86 +225,110 @@ local function scanCommandCenters()
 end
 
 local function drawMinimap()
-    miniCanvas:ClearAllChildren()
-    local char = LOCAL_PLAYER.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    -- Draw player arrow
-    if hrp then
-        local arrow = Instance.new("Frame")
-        arrow.Size = UDim2.new(0, 10, 0, 10)
-        arrow.BackgroundTransparency = 1
-        arrow.BackgroundColor3 = Color3.fromRGB(240,240,240)
-        arrow.AnchorPoint = Vector2.new(0.5, 0.5)
-        arrow.Position = UDim2.new(0.5, 0, 0.5, 0)
-        arrow.Parent = miniCanvas
-    end
-    if latestSnapshot and latestSnapshot.cores and #latestSnapshot.cores > 0 then
-        local n = #latestSnapshot.cores
-        for i, core in ipairs(latestSnapshot.cores) do
-            local frac = (i - 0.5) / n
-            local owner = core.ownerTeam
-            local col = Color3.fromRGB(200, 200, 200)
-            if owner == 1 then col = Color3.fromRGB(255, 70, 70) end
-            if owner == 2 then col = Color3.fromRGB(80, 120, 255) end
-            local center = Instance.new("Frame")
-            center.Size = UDim2.new(0, 8, 0, 8)
-            center.BackgroundColor3 = col
-            center.AnchorPoint = Vector2.new(0.5, 0.5)
-            center.Position = UDim2.new(frac, 0, 0.5, 0)
-            center.Parent = miniCanvas
-            if core.plots then
-                local idx = 0
-                for _, p in ipairs(core.plots) do
-                    idx += 1
-                    local yoff = (idx % 2 == 0) and -10 or 10
-                    local pl = Instance.new("Frame")
-                    pl.Size = UDim2.new(0, 6, 0, 6)
-                    pl.BackgroundColor3 = p.occupied and col or Color3.fromRGB(120,120,120)
-                    pl.AnchorPoint = Vector2.new(0.5, 0.5)
-                    pl.Position = UDim2.new(frac, (idx-1)*2, 0.5, yoff)
-                    pl.Parent = miniCanvas
-                end
-            end
-        end
-    else
-        local cis, rep = scanCommandCenters()
-        if cis then
-            local dot = Instance.new("Frame")
-            dot.Size = UDim2.new(0, 8, 0, 8)
-            dot.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-            dot.Position = UDim2.new(0.25, 0, 0.5, 0)
-            dot.AnchorPoint = Vector2.new(0.5, 0.5)
-            dot.Parent = miniCanvas
-        end
-        if rep then
-            local dot = Instance.new("Frame")
-            dot.Size = UDim2.new(0, 8, 0, 8)
-            dot.BackgroundColor3 = Color3.fromRGB(60, 100, 240)
-            dot.Position = UDim2.new(0.75, 0, 0.5, 0)
-            dot.AnchorPoint = Vector2.new(0.5, 0.5)
-            dot.Parent = miniCanvas
-        end
-    end
+	miniCanvas:ClearAllChildren()
+
+	if not latestSnapshot or not latestSnapshot.cores or #latestSnapshot.cores == 0 then
+		return -- No data to draw
+	end
+
+	-- First-time setup: calculate map boundaries from all plot positions
+	if not mapBoundsMin then
+		local minX, maxX = math.huge, -math.huge
+		local minZ, maxZ = math.huge, -math.huge
+		for _, core in ipairs(latestSnapshot.cores) do
+			if core.plots then
+				for _, plot in ipairs(core.plots) do
+					minX = math.min(minX, plot.position.X)
+					maxX = math.max(maxX, plot.position.X)
+					minZ = math.min(minZ, plot.position.Z)
+					maxZ = math.max(maxZ, plot.position.Z)
+				end
+			end
+		end
+		if minX ~= math.huge then
+			mapBoundsMin = Vector3.new(minX - mapPadding, 0, minZ - mapPadding)
+			mapBoundsMax = Vector3.new(maxX + mapPadding, 0, maxZ + mapPadding)
+		else
+			return -- Still no valid plot data
+		end
+	end
+
+	local mapSize = mapBoundsMax - mapBoundsMin
+	if mapSize.X == 0 or mapSize.Z == 0 then return end -- Avoid division by zero
+
+	local function worldToMinimap(worldPos)
+		local relX = worldPos.X - mapBoundsMin.X
+		local relZ = worldPos.Z - mapBoundsMin.Z
+		-- Note: Mapping world Z to UI Y
+		local fracX = math.clamp(relX / mapSize.X, 0, 1)
+		local fracZ = math.clamp(relZ / mapSize.Z, 0, 1)
+		return UDim2.fromScale(fracX, fracZ)
+	end
+
+	-- Draw plots
+	for _, core in ipairs(latestSnapshot.cores) do
+		if core.plots then
+			for _, plot in ipairs(core.plots) do
+				local plotFrame = Instance.new("Frame")
+				plotFrame.Size = UDim2.new(0, 8, 0, 8) -- Square for each plot
+				plotFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+				plotFrame.Position = worldToMinimap(plot.position)
+				plotFrame.Parent = miniCanvas
+
+				local col = Color3.fromRGB(120, 120, 120) -- Unoccupied gray
+				local transparency = 0.5
+				if plot.occupied then
+					local owner = core.ownerTeam
+					if owner == 1 then -- CIS
+						col = Color3.fromRGB(255, 70, 70)
+					elseif owner == 2 then -- REP
+						col = Color3.fromRGB(80, 120, 255)
+					else -- Occupied but neutral/contested
+						col = Color3.fromRGB(200, 200, 200)
+					end
+					transparency = 0
+				end
+
+				plotFrame.BackgroundColor3 = col
+				plotFrame.BackgroundTransparency = transparency
+				plotFrame.BorderSizePixel = 0
+			end
+		end
+	end
+
+	-- Draw player arrow
+	local char = LOCAL_PLAYER.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		local arrow = Instance.new("ImageLabel") -- Use an image for a triangle shape
+		arrow.Image = "rbxassetid://3926305904" -- Triangle asset
+		arrow.ImageColor3 = Color3.fromRGB(50, 255, 50) -- Bright green
+		arrow.Size = UDim2.new(0, 14, 0, 14)
+		arrow.BackgroundTransparency = 1
+		arrow.AnchorPoint = Vector2.new(0.5, 0.5)
+		arrow.Position = worldToMinimap(hrp.Position)
+
+		-- Calculate rotation from CFrame's orientation
+		local _, yAngle = hrp.CFrame:ToOrientation()
+		arrow.Rotation = -math.deg(yAngle)
+
+		arrow.Parent = miniCanvas
+	end
 end
+
 
 -- CC health readout bottom panel
 local function getPercent(hv)
-    if not hv then return "--" end
-    local max = hv:GetAttribute("Max") or hv.Value
-    if max <= 0 then return "0" end
-    return tostring(math.floor((math.clamp(hv.Value, 0, max)/max)*100 + 0.5))
+	if not hv then return "--" end
+	local max = hv:GetAttribute("Max") or hv.Value
+	if max <= 0 then return "0" end
+	return tostring(math.floor((math.clamp(hv.Value, 0, max)/max)*100 + 0.5))
 end
 
 local function updateBottomPanel()
 	local cis, rep = scanCommandCenters()
 	local cisHv = cis and cis:FindFirstChild("Health")
 	local repHv = rep and rep:FindFirstChild("Health")
-	-- Remove BackgroundTransparency for center and plot squares
-    for _, c in ipairs(miniCanvas:GetDescendants()) do
-        if c:IsA("Frame") then
-            c.BackgroundTransparency = 0.2
-        end
-    end
 	leftCC.Text = string.format("CIS CC: %s%%", getPercent(cisHv))
 	rightCC.Text = string.format("REP CC: %s%%", getPercent(repHv))
 	-- Timer
@@ -319,4 +351,3 @@ RunService.Heartbeat:Connect(function(dt)
 		drawMinimap()
 	end
 end)
-

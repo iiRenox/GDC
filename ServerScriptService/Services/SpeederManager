@@ -1,3 +1,4 @@
+
 -- ModuleScript
 -- SpeederManager in ServerScriptService/Services - MIT CLIENT-SEITIGEN EFFEKTEN
 
@@ -95,7 +96,7 @@ function SpeederManager:HandleFireRequest(player, muzzleCFrame)
 	-- Invisible larger hitbox welded to the projectile to increase hit registration
 	local hitbox = Instance.new("Part")
 	hitbox.Name = "SpeederLaser_Hitbox"
-	hitbox.Size = Vector3.new(6, 8, math.max(7, PROJECTILE_SIZE.Z + 2))
+	hitbox.Size = Vector3.new(12, 8, math.max(7, PROJECTILE_SIZE.Z + 2))
 	hitbox.CFrame = muzzleCFrame
 	hitbox.Anchored = false
 	hitbox.CanCollide = false
@@ -121,8 +122,17 @@ function SpeederManager:HandleFireRequest(player, muzzleCFrame)
 
 	local processed = false
 	local conn1, conn2
-	local function onTouch(hit)
+	local function onTouch(hit, isFromHitbox)
 		if processed then return end
+
+		-- If the touch event is from the large hitbox, ignore terrain collisions.
+		if isFromHitbox then
+			local terrainModel = workspace:FindFirstChild("Ryloth_3D")
+			if terrainModel and hit:IsDescendantOf(terrainModel) then
+				return -- Ignore terrain for the hitbox
+			end
+		end
+
 		local hitModel = hit:FindFirstAncestorWhichIsA("Model")
 		-- Ignore self hits (own speeder/character/projectiles)
 		if hitModel == activeSpeeders[player] or hitModel == player.Character or hit.Name == "SpeederLaser" or hit.Name == "SpeederLaser_Hitbox" then return end
@@ -168,14 +178,14 @@ function SpeederManager:HandleFireRequest(player, muzzleCFrame)
 		processed = true
 		projectile.CanTouch = false
 		projectile.Transparency = 1
-		projectile:Destroy()
+		if projectile and projectile.Parent then projectile:Destroy() end
 		if hitbox and hitbox.Parent then hitbox:Destroy() end
 		if conn1 then conn1:Disconnect(); conn1 = nil end
 		if conn2 then conn2:Disconnect(); conn2 = nil end
 	end
 
-	conn1 = projectile.Touched:Connect(onTouch)
-	conn2 = hitbox.Touched:Connect(onTouch)
+	conn1 = projectile.Touched:Connect(function(hit) onTouch(hit, false) end)
+	conn2 = hitbox.Touched:Connect(function(hit) onTouch(hit, true) end)
 end
 
 function SpeederManager:UpdatePlayerInput(player, inputTable)
