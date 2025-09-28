@@ -1,0 +1,58 @@
+-- File: ServerScriptService/Services/ShieldService
+-- Summary: Normal shield generators (bubble). Blocks damage to friendly models inside radius.
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local ShieldService = {}
+
+-- model -> { team, radius }
+local bubbles = {}
+
+local function getBehaviorKeyForName(name: string)
+	if name:find("ShieldGen_Gold") then return "Shield_Gold" end
+	if name:find("ShieldGen_Silver") then return "Shield_Silver" end
+	if name:find("ShieldGen") then return "Shield_Normal" end
+	return "Shield_Normal"
+end
+
+local function radiusForModel(model: Model)
+	local key = getBehaviorKeyForName(model.Name)
+	local B = (GameConfig.BUILDING_BEHAVIOR and GameConfig.BUILDING_BEHAVIOR[key]) or nil
+	return (B and B.Radius) or 35
+end
+
+function ShieldService:Register(coreId: string, plot, model: Model, ownerTeam: number)
+	bubbles[model] = { team = ownerTeam, radius = radiusForModel(model) }
+	model.Destroying:Connect(function() bubbles[model] = nil end)
+end
+
+function ShieldService:Unregister(model: Model)
+	bubbles[model] = nil
+end
+
+-- Query from CombatService
+function ShieldService:IsBlocked(attacker, targetModel: Model, damageType: string)
+	if not (targetModel and targetModel.Parent) then return false end
+	-- Only shields buildings/vehicles on the same team
+	local ownerTeam = targetModel:GetAttribute("OwnerTeam")
+	if not ownerTeam then return false end
+	local tPos = targetModel:GetPivot().Position
+	for m, b in pairs(bubbles) do
+		if m and m.Parent and b.team == ownerTeam then
+			local pos = m:GetPivot().Position
+			if (tPos - pos).Magnitude <= (b.radius or 0) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Optional visual debug (disabled)
+RunService.Heartbeat:Connect(function() end)
+
+return ShieldService

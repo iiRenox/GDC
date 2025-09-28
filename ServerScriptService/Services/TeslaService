@@ -50,6 +50,11 @@ RunService.Heartbeat:Connect(function(dt)
                                         if teamId == info.ownerTeam then okHit = false end
                                     end
                                 end
+                                -- vehicle/troop models: honor OwnerTeam attribute to avoid friendly fire
+                                if okHit then
+                                    local ownerTid = inst:GetAttribute("OwnerTeam")
+                                    if ownerTid and ownerTid == info.ownerTeam then okHit = false end
+                                end
                                 if okHit then
                                     -- apply damage to humanoids or Health carriers (vehicles/units), not buildings
                                     if hum then

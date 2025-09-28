@@ -46,7 +46,7 @@ local Config = {
 }
 
 function Config.GetPlantBits()
-	return math.random(Config.PLANT_BITS_MIN, Config.PLANT_BITS_MAX)
+    return math.random(Config.PLANT_BITS_MIN, Config.PLANT_BITS_MAX)
 end
 
 -- Canonical fields (added alongside legacy for compatibility)
@@ -57,177 +57,177 @@ Config.BARRACKS = { SPAWN_INTERVAL = 2, SPAWN_AMOUNT = 2, MAX_PER_BARRACK = 25, 
 Config.SPEEDER = { INPUT_RATE_LIMIT = 20, HOVER_HEIGHT = 4.5, RESPAWN_DELAY = 10, MAX_DISTANCE_TO_PLAYER = 200 }
 Config.REMOTE_RATE_LIMITS = { DEFAULT = 5, SPEEDER_INPUT = 20 }
 Config.HEARTS = {
-	PLAYER = 4,
-	TROOP = { stage = 2, count = 2 },
-	VEHICLES = {
-		Speeder = { stage = 1, count = 4 },
-		SmallAir = { stage = 2, count = 2 },
-		MidTier = { stage = 2, count = 5 },
-		Large = { purple = 5 },
-	}
+    PLAYER = 4,
+    TROOP = { stage = 2, count = 2 },
+    VEHICLES = {
+        Speeder = { stage = 1, count = 4 },
+        SmallAir = { stage = 2, count = 2 },
+        MidTier = { stage = 2, count = 5 },
+        Large = { purple = 5 },
+    }
 }
 Config.UI = { RADIAL_RADIUS = 150, HINT_FADE_TIME = 0.25 }
 -- Centralized build limits per backend typeKey
 Config.BUILD_LIMITS = {
-	ProtonNormal = 3,
-	ProtonSilver = 2,
-	TeslaNormal = 1,
-	TeslaSilver = 1,
-	TeslaGold = 1,
-	ATRT = 3,
-	DwarfSpider = 3,
-	Shield_Normal = 2,
-	Shield_Silver = 2,
-	Shield_Gold = 2,
-	RayShield_Normal = 2,
-	RayShield_Silver = 2,
-	RayShield_Gold = 2,
-	Torpedo_Normal = 2,
-	Torpedo_Silver = 2,
-	Torpedo_Gold = 2,
-	Barracks_NormalPack = 6,
-	Barracks_RocketPack = 2,
-	ATST = 3,
-	LaserTank = 3,
-	ATTE = 2,
-	AAT = 2,
-	Hailfire = 2,
-	HomingSpider = 2,
-	Supertank = 2,
-	BitWell = 1,
+    ProtonNormal = 3,
+    ProtonSilver = 2,
+    TeslaNormal = 1,
+    TeslaSilver = 1,
+    TeslaGold = 1,
+    ATRT = 3,
+    DwarfSpider = 3,
+    Shield_Normal = 2,
+    Shield_Silver = 2,
+    Shield_Gold = 2,
+    RayShield_Normal = 2,
+    RayShield_Silver = 2,
+    RayShield_Gold = 2,
+    Torpedo_Normal = 2,
+    Torpedo_Silver = 2,
+    Torpedo_Gold = 2,
+    Barracks_NormalPack = 6,
+    Barracks_RocketPack = 2,
+    ATST = 3,
+    LaserTank = 3,
+    ATTE = 2,
+    AAT = 2,
+    Hailfire = 2,
+    HomingSpider = 2,
+    Supertank = 2,
+    BitWell = 1,
 }
 -- Optional: map specific prefab names to a shared backend typeKey
 Config.BUILD_TYPE_ALIASES = {
-	["CIS_Supertank"] = "Supertank", -- example, extend as needed
+    ["CIS_Supertank"] = "Supertank", -- example, extend as needed
 }
 Config.COSTS = {
-	ProtonNormal = 5000,
-	ProtonSilver = 10000,
-	TeslaNormal = 20000,
-	TeslaSilver = 40000,
-	TeslaGold = 60000,
-	-- Small Air
-	ATRT = 2000,
-	DwarfSpider = 2000,
-	-- Barracks
-	Barracks_NormalPack = 4000,
-	Barracks_RocketPack = 7500,
-	-- Air Support
-	ATST = 12000,
-	ATTE = 50000,
-	LaserTank = 30000,
-	AAT = 12000,
-	HomingSpider = 20000,
-	Hailfire = 12000,
-	Supertank = 50000,
-	-- Shields
-	Shield_Normal = 10000,
-	Shield_Silver = 20000,
-	Shield_Gold = 30000,
-	-- Ray Shields
-	RayShield_Normal = 15000,
-	RayShield_Silver = 30000,
-	RayShield_Gold = 45000,
-	-- Torpedoes
-	Torpedo_Normal = 20000,
-	Torpedo_Silver = 40000,
-	Torpedo_Gold = 60000,
-	-- Extras
-	BitWell = 50000,
+    ProtonNormal = 5000,
+    ProtonSilver = 10000,
+    TeslaNormal = 20000,
+    TeslaSilver = 40000,
+    TeslaGold = 60000,
+    -- Small Air
+    ATRT = 2000,
+    DwarfSpider = 2000,
+    -- Barracks
+    Barracks_NormalPack = 4000,
+    Barracks_RocketPack = 7500,
+    -- Air Support
+    ATST = 12000,
+    ATTE = 50000,
+    LaserTank = 30000,
+    AAT = 12000,
+    HomingSpider = 20000,
+    Hailfire = 12000,
+    Supertank = 50000,
+    -- Shields
+    Shield_Normal = 10000,
+    Shield_Silver = 20000,
+    Shield_Gold = 30000,
+    -- Ray Shields
+    RayShield_Normal = 15000,
+    RayShield_Silver = 30000,
+    RayShield_Gold = 45000,
+    -- Torpedoes
+    Torpedo_Normal = 20000,
+    Torpedo_Silver = 40000,
+    Torpedo_Gold = 60000,
+    -- Extras
+    BitWell = 50000,
 }
 -- Icon key helpers: the UI will resolve via ReplicatedStorage.IconAssetIds using keys like "Images/<Name>"
 -- Category representative icon keys by index (optional; UI falls back to generic)
 Config.CATEGORY_ICON_KEYS = {
-	[1] = "Images/Ground",
-	[2] = "Images/Rep_Support_SmallAir",
-	[3] = "Images/Rep_Barracks",
-	[4] = "Images/Rep_Support_Air",
-	[5] = "Images/Shield",
-	[6] = "Images/RayShieldGen",
-	[7] = "Images/Torpedo_Normal",
-	[8] = "Images/Extra",
+    [1] = "Images/Ground",
+    [2] = "Images/Rep_Support_SmallAir",
+    [3] = "Images/Rep_Barracks",
+    [4] = "Images/Rep_Support_Air",
+    [5] = "Images/Shield",
+    [6] = "Images/RayShieldGen",
+    [7] = "Images/Torpedo_Normal",
+    [8] = "Images/Extra",
 }
 Config.DEFAULTS = { STUN_DURATION = 2, BUILDING_REGEN_RATE = 0.5 }
 -- Per-building health/regen defaults and overrides
 Config.BUILDING_STATS = {
-	Default = { MaxHP = 800, RegenPercentPerMin = 0.5 },
-	-- Command Centers: can be damaged by lasers again, but regen is very strong and always active
-	CommandCenter = { MaxHP = 80, RegenPercentPerMin = 60, NoCooldown = true },
-	-- Ground Assault
-	ProtonNormal   = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	ProtonSilver   = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	TeslaNormal    = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	TeslaSilver    = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	TeslaGold      = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Small Air Support
-	ATRT           = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	DwarfSpider    = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Barracks
-	Barracks_NormalPack = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Barracks_RocketPack = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Air Support
-	ATST          = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	LaserTank     = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	ATTE          = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	AAT           = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Hailfire      = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	HomingSpider  = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Supertank     = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Shields
-	Shield_Normal = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Shield_Silver = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Shield_Gold   = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Ray Shields
-	RayShield_Normal = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	RayShield_Silver = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	RayShield_Gold   = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Torpedoes
-	Torpedo_Normal = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Torpedo_Silver = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	Torpedo_Gold   = { MaxHP = 40, RegenPercentPerMin = 0.5 },
-	-- Extras
-	BitWell        = { MaxHP = 40, RegenPercentPerMin = 0.5 },
+    Default = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Command Centers: can be damaged by lasers again, but regen is very strong and always active
+    CommandCenter = { MaxHP = 1000, RegenPercentPerMin = 240, NoCooldown = true },
+    -- Ground Assault
+    ProtonNormal   = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    ProtonSilver   = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    TeslaNormal    = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    TeslaSilver    = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    TeslaGold      = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Small Air Support
+    ATRT           = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    DwarfSpider    = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Barracks
+    Barracks_NormalPack = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Barracks_RocketPack = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Air Support
+    ATST          = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    LaserTank     = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    ATTE          = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    AAT           = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Hailfire      = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    HomingSpider  = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Supertank     = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Shields
+    Shield_Normal = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Shield_Silver = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Shield_Gold   = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Ray Shields
+    RayShield_Normal = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    RayShield_Silver = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    RayShield_Gold   = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Torpedoes
+    Torpedo_Normal = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Torpedo_Silver = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    Torpedo_Gold   = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
+    -- Extras
+    BitWell        = { MaxHP = 1000, RegenPercentPerMin = 0.5 },
 }
 Config.DEV_MODE = true
 -- Per-building visibility in radial build menu (default true if key missing)
 Config.BUILD_MENU_VISIBLE = {
-	-- Command Centers
-	CIS_CommandCenter = true,
-	Rep_CommandCenter = true,
-	-- Ground (Proton/Tesla)
-	ProtonNormal = true,
-	ProtonSilver = true,
-	TeslaNormal = true,
-	TeslaSilver = true,
-	TeslaGold = true,
-	-- Small Air
-	ATRT = true,
-	DwarfSpider = true,
-	-- Barracks
-	Barracks_NormalPack = true,
-	Barracks_RocketPack = true,
-	-- Air Support
-	ATST = true,
-	LaserTank = true,
-	ATTE = true,
-	AAT = true,
-	Hailfire = true,
-	HomingSpider = true,
-	Supertank = true,
-	-- Shields
-	Shield_Normal = true,
-	Shield_Silver = true,
-	Shield_Gold = true,
-	-- Ray Shields
-	RayShield_Normal = true,
-	RayShield_Silver = true,
-	RayShield_Gold = true,
-	-- Torpedoes
-	Torpedo_Normal = true,
-	Torpedo_Silver = true,
-	Torpedo_Gold = true,
-	-- Extras
-	BitWell = true,
+    -- Command Centers
+    CIS_CommandCenter = true,
+    Rep_CommandCenter = true,
+    -- Ground (Proton/Tesla)
+    ProtonNormal = true,
+    ProtonSilver = true,
+    TeslaNormal = true,
+    TeslaSilver = true,
+    TeslaGold = true,
+    -- Small Air
+    ATRT = true,
+    DwarfSpider = true,
+    -- Barracks
+    Barracks_NormalPack = true,
+    Barracks_RocketPack = true,
+    -- Air Support
+    ATST = true,
+    LaserTank = true,
+    ATTE = true,
+    AAT = true,
+    Hailfire = true,
+    HomingSpider = true,
+    Supertank = true,
+    -- Shields
+    Shield_Normal = true,
+    Shield_Silver = true,
+    Shield_Gold = true,
+    -- Ray Shields
+    RayShield_Normal = true,
+    RayShield_Silver = true,
+    RayShield_Gold = true,
+    -- Torpedoes
+    Torpedo_Normal = true,
+    Torpedo_Silver = true,
+    Torpedo_Gold = true,
+    -- Extras
+    BitWell = true,
 }
 
 return Config

@@ -1,18 +1,24 @@
 -- File: ServerScriptService/Services/TorpedoService
--- Modified/Created by: GPT-5 (Cursor) — 2025-08-09
--- Summary: Speeder torpedo pickup and homing to core ball; on impact destroys one random building on that core.
+-- Summary: Torpedo launchers give ammo to vehicles flying over them (Speeder max 1, other vehicles max 3).
+-- Vehicles can fire to lock onto AT-TE, Supertank, or enemy cores (not ray-shielded). On core impact, destroy one random building on that core.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local ServerStorage = game:GetService("ServerStorage")
 local Debris = game:GetService("Debris")
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
 
 local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local okRay, RayShieldService = pcall(require, script.Parent:FindFirstChild("RayShieldService"))
+local okHealth, HealthService = pcall(require, script.Parent:FindFirstChild("HealthService"))
+local okSpeeder, SpeederManager = pcall(require, script.Parent:FindFirstChild("SpeederManager"))
 
 local TorpedoService = {}
 
 local coreIdToLaunchers = {}
-local playerHasTorpedo = {}
+local launchers = {} -- list of all launcher models
+local lastPickupAt = setmetatable({}, { __mode = "k" }) -- model -> time
 
 local function getCoreBall(coreId: string)
     -- Expect inside core folder a part named Core_*_*_Ball
@@ -36,24 +42,59 @@ end
 function TorpedoService:RegisterLauncher(coreId: string, plot, model)
     coreIdToLaunchers[coreId] = coreIdToLaunchers[coreId] or {}
     table.insert(coreIdToLaunchers[coreId], { plot = plot, model = model })
-    -- Add pickup trigger
-    local pickupPart = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-    if not pickupPart then return end
-    local prompt = Instance.new("ProximityPrompt")
-    prompt.Name = "PickupTorpedo"
-    prompt.ActionText = "Pickup Torpedo"
-    prompt.ObjectText = coreId
-    prompt.KeyboardKeyCode = Enum.KeyCode.E
-    prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
-    prompt.HoldDuration = 0.5
-    prompt.MaxActivationDistance = 10
-    prompt.Parent = pickupPart
-    prompt.Triggered:Connect(function(player)
-        playerHasTorpedo[player] = coreId
+    table.insert(launchers, model)
+    model.Destroying:Connect(function()
+        for i = #launchers, 1, -1 do if launchers[i] == model then table.remove(launchers, i) end end
     end)
 end
 
-local function spawnHomingTorpedo(player, targetInstance)
+local function setAmmo(vehicle: Model, amount, capacity)
+    if not (vehicle and vehicle.Parent) then return end
+    local max = capacity or vehicle:GetAttribute("TorpedoMaxAmmo") or 1
+    vehicle:SetAttribute("TorpedoMaxAmmo", max)
+    vehicle:SetAttribute("TorpedoAmmo", math.clamp(amount, 0, max))
+end
+
+local function getAmmo(vehicle: Model)
+    return (vehicle and vehicle:GetAttribute("TorpedoAmmo")) or 0
+end
+
+local function capacityForVehicle(vehicle: Model)
+    if not vehicle then return 1 end
+    if CollectionService:HasTag(vehicle, "Speeder") then return 1 end
+    return 3
+end
+
+local function isVehicle(model: Model)
+    if not model or not model:IsA("Model") then return false end
+    if model:GetAttribute("IsVehicle") then return true end
+    if CollectionService:HasTag(model, "Speeder") then return true end
+    return false
+end
+
+local function findPlayerVehicle(player)
+    -- Prefer occupied VehicleSeat ancestor
+    local char = player.Character
+    if char then
+        local seat = char:FindFirstChildOfClass("Humanoid") and char:FindFirstChildOfClass("Humanoid").SeatPart
+        if seat then
+            local model = seat:FindFirstAncestorOfClass("Model")
+            if isVehicle(model) then return model end
+        end
+    end
+    -- Fallback: active speeder
+    if okSpeeder and SpeederManager and SpeederManager.GetActiveSpeedersList then
+        for _, sp in ipairs(SpeederManager:GetActiveSpeedersList()) do
+            if sp and sp.Parent then
+                local vs = sp:FindFirstChild("VehicleSeat")
+                if vs and vs.Occupant and vs.Occupant.Parent == char then return sp end
+            end
+        end
+    end
+    return nil
+end
+
+local function spawnHomingTorpedo(ownerModelOrPlayer, targetInstance)
     local part = Instance.new("Part")
     part.Name = "Torpedo"
     part.Size = Vector3.new(1,1,2)
@@ -61,7 +102,14 @@ local function spawnHomingTorpedo(player, targetInstance)
     part.BrickColor = BrickColor.new("New Yeller")
     part.CanCollide = false
     part.Anchored = false
-    part.CFrame = player.Character and player.Character:GetPivot() * CFrame.new(0,3,-2) or CFrame.new()
+    local cf
+    if typeof(ownerModelOrPlayer) == "Instance" and ownerModelOrPlayer:IsA("Model") then
+        cf = ownerModelOrPlayer:GetPivot()
+    else
+        local plr = ownerModelOrPlayer
+        cf = (plr.Character and plr.Character:GetPivot()) or CFrame.new()
+    end
+    part.CFrame = cf * CFrame.new(0,3,-2)
     part.Parent = Workspace
     part:SetNetworkOwner(nil)
     local att = Instance.new("BodyVelocity")
@@ -89,22 +137,137 @@ local function spawnHomingTorpedo(player, targetInstance)
         if part.Parent then
             part:Destroy()
         end
+        -- Impact handling by target type
         local BuildManager = require(script.Parent:WaitForChild("BuildManager"))
-        local coreId = playerHasTorpedo[player]
-        if coreId then
-            BuildManager:DestroyRandomBuilding(coreId)
-            playerHasTorpedo[player] = nil
+        local hitModel = targetInstance:FindFirstAncestorWhichIsA("Model")
+        if hitModel then
+            local n = hitModel.Name
+            if n:find("AT%-TE") or n:find("ATTE") or n:find("Supertank") then
+                if okHealth and HealthService then
+                    HealthService:TakeHit(hitModel, "Torpedo", nil)
+                else
+                    -- fallback: reduce Health IntValue by 1
+                    local hv = hitModel:FindFirstChild("Health")
+                    if hv and hv:IsA("IntValue") then hv.Value = math.max(0, hv.Value - 1) end
+                end
+            else
+                -- Try core ball detection
+                local coreId = nil
+                do
+                    local map = Workspace:FindFirstChild("Ryloth")
+                    local a = hitModel
+                    while a and map and a ~= map do
+                        if a.Parent == map then coreId = a.Name; break end
+                        a = a.Parent
+                    end
+                end
+                if coreId then
+                    BuildManager:DestroyRandomBuilding(coreId)
+                end
+            end
         end
     end)
 end
 
-function TorpedoService:Fire(player)
-    local coreId = playerHasTorpedo[player]
-    if not coreId then return end
-    local ball = getCoreBall(coreId)
-    if not ball then return end
-    spawnHomingTorpedo(player, ball)
+local function findTargetsFor(vehicle: Model)
+    local targets = {}
+    -- Vehicles: AT-TE and Supertank
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("Model") then
+            local n = inst.Name
+            if n:find("AT%-TE") or n:find("ATTE") or n:find("Supertank") then
+                local p = inst:GetPivot().Position
+                table.insert(targets, { inst = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart"), pos = p, prio = 2 })
+            end
+        end
+    end
+    -- Cores: use core balls
+    local map = Workspace:FindFirstChild("Ryloth")
+    if map then
+        for _, core in ipairs(map:GetChildren()) do
+            local coreId = core.Name
+            if not (okRay and RayShieldService and RayShieldService:IsCoreShielded(coreId)) then
+                local ball = getCoreBall(coreId)
+                if ball then
+                    table.insert(targets, { inst = ball, pos = ball.Position, prio = 1, coreId = coreId })
+                end
+            end
+        end
+    end
+    -- Sort by priority then distance
+    local vpos = (vehicle and vehicle:GetPivot().Position) or Vector3.zero
+    table.sort(targets, function(a,b)
+        if a.prio ~= b.prio then return a.prio > b.prio end
+        return (a.pos - vpos).Magnitude < (b.pos - vpos).Magnitude
+    end)
+    return targets
 end
+
+function TorpedoService:FireFromVehicle(vehicle: Model)
+    if not (vehicle and vehicle.Parent) then return end
+    local ammo = getAmmo(vehicle)
+    if ammo <= 0 then return end
+    local targets = findTargetsFor(vehicle)
+    if #targets == 0 then return end
+    local t = targets[1]
+    spawnHomingTorpedo(vehicle, t.inst)
+    setAmmo(vehicle, ammo - 1, capacityForVehicle(vehicle))
+end
+
+function TorpedoService:FireFromPlayer(player)
+    local v = findPlayerVehicle(player)
+    if v then self:FireFromVehicle(v) end
+end
+
+-- Remote to let clients request fire
+do
+    local Remotes = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder", ReplicatedStorage)
+    Remotes.Name = "Remotes"
+    local RE_Fire = Remotes:FindFirstChild("RE_Torpedo_Fire") or Instance.new("RemoteEvent")
+    RE_Fire.Name = "RE_Torpedo_Fire"
+    RE_Fire.Parent = Remotes
+    RE_Fire.OnServerEvent:Connect(function(player)
+        TorpedoService:FireFromPlayer(player)
+    end)
+end
+
+-- Heartbeat: grant ammo to vehicles flying above launchers
+game:GetService("RunService").Heartbeat:Connect(function()
+    if #launchers == 0 then return end
+    for _, launcher in ipairs(launchers) do
+        if launcher and launcher.Parent then
+            local base = launcher.PrimaryPart or launcher:FindFirstChildWhichIsA("BasePart")
+            if base then
+                local origin = base.Position
+                local radius = math.max(12, (base.Size and math.max(base.Size.X, base.Size.Z)/2) or 12)
+                -- Scan nearby vehicles
+                for _, inst in ipairs(Workspace:GetDescendants()) do
+                    if inst:IsA("Model") and isVehicle(inst) then
+                        local root = inst.PrimaryPart or inst:FindFirstChild("HumanoidRootPart") or inst:FindFirstChildWhichIsA("BasePart")
+                        if root then
+                            local horiz = Vector2.new(root.Position.X, root.Position.Z) - Vector2.new(origin.X, origin.Z)
+                            local dist = horiz.Magnitude
+                            local isAbove = root.Position.Y > origin.Y + 4
+                            if dist <= radius and isAbove then
+                                -- pickup cooldown per vehicle per launcher
+                                local now = os.clock()
+                                local last = lastPickupAt[inst]
+                                if not last or (now - last) > 2.0 then
+                                    local cap = capacityForVehicle(inst)
+                                    local cur = getAmmo(inst)
+                                    if cur < cap then
+                                        setAmmo(inst, cur + 1, cap)
+                                        lastPickupAt[inst] = now
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
 
 return TorpedoService
 

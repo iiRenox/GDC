@@ -1,0 +1,137 @@
+-- File: ServerScriptService/Services/RayShieldService
+-- Summary: Rayshield building that projects a beam forward. Any building or core intersected becomes shielded (no damage) while beam is on it.
+-- Players can operate to rotate via prompts (simple left/right rotation). Future: client-operated UI.
+
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local RayShieldService = {}
+
+-- model -> state
+local rayShields = {}
+-- shielded sets
+local shieldedModels = {} -- [Model]=true while protected by a beam
+local shieldedCores = {}  -- [coreId]=true while protected by a beam
+
+local function findCoreIdFromInstance(inst: Instance)
+	local map = Workspace:FindFirstChild("Ryloth")
+	if not map then return nil end
+	local a = inst
+	while a and a ~= map do
+		if a.Parent == map then
+			-- direct core folder child
+			return a.Name
+		end
+		a = a.Parent
+	end
+	return nil
+end
+
+function RayShieldService:Register(coreId: string, plot, model: Model, ownerTeam: number)
+	rayShields[model] = {
+		team = ownerTeam,
+		coreId = coreId,
+		angle = 0,
+		length = 300,
+		width = 3,
+		lastHitModel = nil,
+		lastHitCoreId = nil,
+	}
+	model.Destroying:Connect(function()
+		-- clear previous shielding
+		local st = rayShields[model]
+		if st then
+			if st.lastHitModel then shieldedModels[st.lastHitModel] = nil end
+			if st.lastHitCoreId then shieldedCores[st.lastHitCoreId] = nil end
+			rayShields[model] = nil
+		end
+	end)
+	-- Simple rotate prompts
+	local ppParent = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if ppParent then
+		local left = Instance.new("ProximityPrompt")
+		left.Name = "RotateLeft"
+		left.ActionText = "Rotate Left"
+		left.KeyboardKeyCode = Enum.KeyCode.Q
+		left.MaxActivationDistance = 10
+		left.Parent = ppParent
+		left.Triggered:Connect(function()
+			local st = rayShields[model]
+			if st then st.angle -= math.rad(10) end
+		end)
+		local right = Instance.new("ProximityPrompt")
+		right.Name = "RotateRight"
+		right.ActionText = "Rotate Right"
+		right.KeyboardKeyCode = Enum.KeyCode.E
+		right.MaxActivationDistance = 10
+		right.Parent = ppParent
+		right.Triggered:Connect(function()
+			local st = rayShields[model]
+			if st then st.angle += math.rad(10) end
+		end)
+	end
+end
+
+function RayShieldService:Unregister(model: Model)
+	local st = rayShields[model]
+	if st then
+		if st.lastHitModel then shieldedModels[st.lastHitModel] = nil end
+		if st.lastHitCoreId then shieldedCores[st.lastHitCoreId] = nil end
+		rayShields[model] = nil
+	end
+end
+
+-- Queries for other systems
+function RayShieldService:IsShielded(model: Model)
+	return shieldedModels[model] == true
+end
+function RayShieldService:IsCoreShielded(coreId: string)
+	return shieldedCores[coreId] == true
+end
+
+-- Step: cast beams and update shielded sets
+RunService.Heartbeat:Connect(function()
+	for model, st in pairs(rayShields) do
+		if not (model and model.Parent) then rayShields[model] = nil else
+			-- clear last
+			if st.lastHitModel then shieldedModels[st.lastHitModel] = nil; st.lastHitModel = nil end
+			if st.lastHitCoreId then shieldedCores[st.lastHitCoreId] = nil; st.lastHitCoreId = nil end
+			-- compute forward direction
+			local base = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+			if base then
+				local forward = base.CFrame.LookVector
+				-- apply yaw angle around Y
+				local rot = CFrame.Angles(0, st.angle, 0)
+				local dir = (rot:VectorToWorldSpace(forward)).Unit
+				local origin = base.Position + Vector3.new(0, base.Size.Y*0.5, 0)
+				local params = RaycastParams.new()
+				params.FilterDescendantsInstances = { model }
+				params.FilterType = Enum.RaycastFilterType.Exclude
+				local result = Workspace:Raycast(origin, dir * st.length, params)
+				if result then
+					local hitInst = result.Instance
+					local hitModel = hitInst:FindFirstAncestorWhichIsA("Model")
+					if hitModel then
+						-- protect buildings and cores while beam intersects
+						shieldedModels[hitModel] = true
+						st.lastHitModel = hitModel
+						local coreId = findCoreIdFromInstance(hitModel)
+						if coreId then
+							shieldedCores[coreId] = true
+							st.lastHitCoreId = coreId
+						end
+					else
+						-- try core detection by folder
+						local coreId = findCoreIdFromInstance(hitInst)
+						if coreId then shieldedCores[coreId] = true; st.lastHitCoreId = coreId end
+					end
+				end
+			end
+		end
+	end
+end)
+
+return RayShieldService

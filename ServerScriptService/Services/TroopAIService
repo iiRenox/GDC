@@ -1,0 +1,122 @@
+-- File: ServerScriptService/Services/TroopAIService
+-- Summary: Spawns/controls troops and executes team-wide orders from CommanderService (attack building / move to point).
+
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local CombatService = require(script.Parent:WaitForChild("CombatService"))
+
+local TroopAIService = {}
+
+-- teamId -> current order { type = "attack", target = Model } or { type = "move", position = Vector3 }
+local teamOrders = {}
+-- Cached troops per team (models with Humanoid, not buildings)
+local teamTroops = {}
+
+local function playerTeamName(tid)
+	return (tid == GameConfig.TEAM.REP) and GameConfig.Teams[2].Name or (tid == GameConfig.TEAM.CIS) and GameConfig.Teams[1].Name or "?"
+end
+
+local function isTroopModel(m: Model)
+	if not (m and m:IsA("Model")) then return false end
+	if m:GetAttribute("IsBuilding") then return false end
+	if not m:FindFirstChildOfClass("Humanoid") then return false end
+	if CollectionService:HasTag(m, "Vehicle") or CollectionService:HasTag(m, "Speeder") then return false end
+	-- optional explicit tag/attr
+	if m:GetAttribute("IsTroop") then return true end
+	-- fallback heuristic: has a Humanoid and a weapon folder maybe
+	return true
+end
+
+local function refreshTroops()
+	local newMap = {}
+	for _, m in ipairs(Workspace:GetDescendants()) do
+		if m:IsA("Model") and isTroopModel(m) then
+			local tid = m:GetAttribute("OwnerTeam")
+			if tid then
+				newMap[tid] = newMap[tid] or {}
+				table.insert(newMap[tid], m)
+			end
+		end
+	end
+	teamTroops = newMap
+end
+
+-- Public API for CommanderService
+function TroopAIService:OrderAttackTeam(teamId: number, targetBuilding: Model)
+	if not (targetBuilding and targetBuilding:GetAttribute("IsBuilding")) then return end
+	teamOrders[teamId] = { type = "attack", target = targetBuilding }
+end
+
+function TroopAIService:OrderMoveTeam(teamId: number, position: Vector3)
+	teamOrders[teamId] = { type = "move", position = position }
+end
+
+-- Internal shooting helper
+local FIRE_INTERVAL = 0.6
+local MAX_RANGE = 180
+local lastFiredAt = setmetatable({}, { __mode = "k" }) -- troop model -> time
+
+local function lineOfSight(fromPos: Vector3, toPos: Vector3, ignoreInst)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { ignoreInst }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local result = Workspace:Raycast(fromPos, (toPos - fromPos))
+	if not result then return true end
+	return (result.Position - toPos).Magnitude <= 4
+end
+
+-- Main loop: execute orders
+RunService.Heartbeat:Connect(function(dt)
+	-- refresh troop cache at low frequency
+	local tnow = os.clock()
+	if (TroopAIService._lastRefresh or 0) < tnow - 1.5 then
+		refreshTroops()
+		TroopAIService._lastRefresh = tnow
+	end
+	for tid, troops in pairs(teamTroops) do
+		local order = teamOrders[tid]
+		if order then
+			if order.type == "move" and order.position then
+				for _, troop in ipairs(troops) do
+					local hum = troop:FindFirstChildOfClass("Humanoid")
+					if hum then
+						local p = order.position
+						if (troop:GetPivot().Position - p).Magnitude > 6 then
+							pcall(function() hum:MoveTo(p) end)
+						end
+					end
+				end
+			elseif order.type == "attack" and order.target and order.target.Parent then
+				local tgt = order.target
+				local tgtPos = tgt:GetPivot().Position
+				for _, troop in ipairs(troops) do
+					local hum = troop:FindFirstChildOfClass("Humanoid")
+					local root = troop.PrimaryPart or troop:FindFirstChild("HumanoidRootPart") or troop:FindFirstChildWhichIsA("BasePart")
+					if hum and root then
+						-- move closer if out of range
+						local dist = (root.Position - tgtPos).Magnitude
+						if dist > MAX_RANGE then
+							pcall(function() hum:MoveTo(tgtPos) end)
+						else
+							-- fire at interval if LoS
+							local last = lastFiredAt[troop] or 0
+							if (tnow - last) >= FIRE_INTERVAL then
+								if lineOfSight(root.Position, tgtPos, troop) then
+									lastFiredAt[troop] = tnow
+									-- Apply small damage via CombatService (HighImpact), server-side authoritative
+									CombatService:ApplyDamage(root, tgt, 1, CombatService.DamageType and CombatService.DamageType.HighImpact or "HighImpact")
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+return TroopAIService

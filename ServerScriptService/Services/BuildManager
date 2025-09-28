@@ -13,6 +13,9 @@ local TweenService = game:GetService("TweenService")
 local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
 local okTorp, TorpedoService = pcall(require, script.Parent:FindFirstChild("TorpedoService"))
 local okTesla, TeslaService = pcall(require, script.Parent:FindFirstChild("TeslaService"))
+local okShield, ShieldService = pcall(require, script.Parent:FindFirstChild("ShieldService"))
+local okRayShield, RayShieldService = pcall(require, script.Parent:FindFirstChild("RayShieldService"))
+local okAir, AirSupportService = pcall(require, script.Parent:FindFirstChild("AirSupportService"))
 local PlayerManager = require(script.Parent:WaitForChild("PlayerManager"))
 
 local BuildManager = {}
@@ -799,6 +802,22 @@ end
 local function onBuildingDestroyed(core, plot, model)
 	if model:GetAttribute("BD_DroppedStuds") then return end
 	model:SetAttribute("BD_DroppedStuds", true)
+	-- Proactively unregister special services so effects stop immediately
+	pcall(function()
+		if okShield and ShieldService and string.find(model.Name, "ShieldGen") and not (string.find(model.Name, "RayShieldGen") or string.find(model.Name, "ReyShieldGen")) then
+			ShieldService:Unregister(model)
+		end
+	end)
+	pcall(function()
+		if okRayShield and RayShieldService and (string.find(model.Name, "RayShieldGen") or string.find(model.Name, "ReyShieldGen")) then
+			RayShieldService:Unregister(model)
+		end
+	end)
+	pcall(function()
+		if okAir and AirSupportService and (string.find(model.Name, "Support_Air") or string.find(model.Name, "Support_SmallAir")) then
+			AirSupportService:DespawnForBuilding(model)
+		end
+	end)
 	-- Drop Bits (70% of cost) resolving from known name patterns
 	local cost = 0
 	if GameConfig.COSTS then
@@ -895,6 +914,22 @@ local function setupBuilding(core, plot)
 	if okTesla and TeslaService then
 		if string.find(model.Name, "Tesla") then
 			TeslaService:RegisterTesla(core.id, plot, model, core.ownerTeam)
+		end
+	end
+	if okShield and ShieldService then
+		if string.find(model.Name, "ShieldGen") and not (string.find(model.Name, "RayShieldGen") or string.find(model.Name, "ReyShieldGen")) then
+			ShieldService:Register(core.id, plot, model, core.ownerTeam)
+		end
+	end
+	if okRayShield and RayShieldService then
+		if string.find(model.Name, "RayShieldGen") or string.find(model.Name, "ReyShieldGen") then
+			RayShieldService:Register(core.id, plot, model, core.ownerTeam)
+		end
+	end
+	if okAir and AirSupportService then
+		-- Support buildings that spawn vehicles on call
+		if string.find(model.Name, "Support_Air") or string.find(model.Name, "Support_SmallAir") then
+			AirSupportService:Register(core.id, plot, model, core.ownerTeam)
 		end
 	end
 end

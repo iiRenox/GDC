@@ -1,0 +1,58 @@
+-- File: ServerScriptService/Services/HealthService
+-- Summary: Registers vehicles and troops with heart-based health via ReplicatedStorage/Modules/HeartSystem.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+
+local HeartSystem = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("HeartSystem"))
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local HealthService = {}
+
+-- Defaults if GameConfig.UNIT_HEARTS is missing
+local DEFAULT_UNIT_HEARTS = {
+	-- Walkers / heavies
+	ATTE = { purple = 5, currentStage = "purple" },
+	Supertank = { purple = 5, currentStage = "purple" },
+	-- Mid vehicles
+	ATST = { stage2 = 0, stage1 = 2, normal = 5, currentStage = "normal" },
+	LaserTank = { normal = 5, currentStage = "normal" },
+	AAT = { normal = 5, currentStage = "normal" },
+	Hailfire = { normal = 5, currentStage = "normal" },
+	-- Small
+	ATRT = { normal = 3, currentStage = "normal" },
+	DwarfSpider = { normal = 3, currentStage = "normal" },
+}
+
+local function heartsForType(typeKey)
+	local tbl = (GameConfig.UNIT_HEARTS and GameConfig.UNIT_HEARTS[typeKey]) or DEFAULT_UNIT_HEARTS[typeKey]
+	if tbl then return table.clone(tbl) end
+	return { normal = 3, currentStage = "normal" }
+end
+
+function HealthService:Register(model: Model, typeKey: string)
+	if not (model and model.Parent) then return end
+	local id = model:GetAttribute("UnitId")
+	if not id then
+		id = HttpService:GenerateGUID(false)
+		model:SetAttribute("UnitId", id)
+	end
+	local hearts = heartsForType(typeKey)
+	HeartSystem:RegisterUnit(id, hearts)
+	-- Auto-destroy hook
+	HeartSystem:On("Destroyed", function(unitId, attacker)
+		if unitId == id and model and model.Parent then
+			model:Destroy()
+		end
+	end)
+	return id
+end
+
+function HealthService:TakeHit(model: Model, damageType: string, attacker)
+	local id = model and model:GetAttribute("UnitId")
+	if id then
+		HeartSystem:TakeHit(id, damageType, attacker)
+	end
+end
+
+return HealthService

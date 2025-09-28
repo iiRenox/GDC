@@ -1,0 +1,94 @@
+-- File: ServerScriptService/Services/AirSupportService
+-- Summary: Manages air/vehicle spawn calls from Support_Air buildings. One active vehicle per building; new call despawns old.
+
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local okHealth, HealthService = pcall(require, script.Parent:FindFirstChild("HealthService"))
+
+local AirSupportService = {}
+
+-- model -> { vehicle = Model?, ownerTeam = number, variant = string? }
+local activeByBuilding = {}
+
+local function spawnVehicleFor(buildModel: Model, ownerTeam: number)
+	local info = activeByBuilding[buildModel]
+	if not info then return end
+	-- Decide variant: prefer building attribute Variant (set by BuildManager purchase)
+	local variant = buildModel:GetAttribute("Variant") or info.variant
+	if not variant then
+		-- Sensible defaults per team
+		if ownerTeam == GameConfig.TEAM.REP then
+			variant = "ATST" -- fallback
+		else
+			variant = "Supertank"
+		end
+	end
+	info.variant = variant
+	local prefabs = ServerStorage:FindFirstChild("UnitPrefabs")
+	local prefab = prefabs and prefabs:FindFirstChild(variant)
+	if not (prefab and prefab:IsA("Model")) then
+		warn("AirSupportService: missing UnitPrefabs/" .. tostring(variant))
+		return
+	end
+	-- Despawn old
+	if info.vehicle and info.vehicle.Parent then info.vehicle:Destroy() end
+	-- Spawn new near the building
+	local spawnCF = (buildModel.PrimaryPart or buildModel:FindFirstChildWhichIsA("BasePart") or buildModel:GetPivot())
+	local cf = typeof(spawnCF) == "CFrame" and spawnCF or spawnCF.CFrame
+	local vehicle = prefab:Clone()
+	vehicle.Name = variant
+	vehicle:PivotTo(cf * CFrame.new(0, 6, -18))
+	vehicle:SetAttribute("OwnerTeam", ownerTeam)
+	vehicle:SetAttribute("IsVehicle", true)
+	vehicle.Parent = Workspace
+	activeByBuilding[buildModel].vehicle = vehicle
+	if okHealth and HealthService then
+		pcall(function()
+			HealthService:Register(vehicle, variant)
+		end)
+	end
+end
+
+function AirSupportService:Register(coreId: string, plot, model: Model, ownerTeam: number)
+	activeByBuilding[model] = { ownerTeam = ownerTeam, variant = model:GetAttribute("Variant") }
+	model.Destroying:Connect(function()
+		local info = activeByBuilding[model]
+		if info and info.vehicle and info.vehicle.Parent then info.vehicle:Destroy() end
+		activeByBuilding[model] = nil
+	end)
+	-- Add simple call prompt to trigger spawn/replace
+	local ppParent = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not ppParent then return end
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "CallAirSupport"
+	prompt.ActionText = "Call Vehicle"
+	prompt.ObjectText = "Air Support"
+	prompt.KeyboardKeyCode = Enum.KeyCode.F
+	prompt.GamepadKeyCode = Enum.KeyCode.ButtonY
+	prompt.MaxActivationDistance = 12
+	prompt.Parent = ppParent
+	prompt.Triggered:Connect(function(player)
+		-- Only owner team can call
+		local tid = nil
+		if player and player.Team then
+			local repName = GameConfig.Teams[2].Name
+			local cisName = GameConfig.Teams[1].Name
+			tid = (player.Team.Name == repName) and GameConfig.TEAM.REP or (player.Team.Name == cisName) and GameConfig.TEAM.CIS or nil
+		end
+		if tid and tid == ownerTeam then
+			spawnVehicleFor(model, ownerTeam)
+		end
+	end)
+end
+
+function AirSupportService:DespawnForBuilding(model: Model)
+	local info = activeByBuilding[model]
+	if not info then return end
+	if info.vehicle and info.vehicle.Parent then info.vehicle:Destroy() end
+	info.vehicle = nil
+end
+
+return AirSupportService

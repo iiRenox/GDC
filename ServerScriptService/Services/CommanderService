@@ -1,0 +1,52 @@
+-- File: ServerScriptService/Services/CommanderService
+-- Summary: Allows players to command their team's troops to attack buildings or move to a point.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local okTroops, TroopAIService = pcall(require, script.Parent:FindFirstChild("TroopAIService"))
+
+local CommanderService = {}
+
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder", ReplicatedStorage)
+Remotes.Name = "Remotes"
+local RE_AttackBuilding = Remotes:FindFirstChild("RE_Command_AttackBuilding") or Instance.new("RemoteEvent")
+RE_AttackBuilding.Name = "RE_Command_AttackBuilding"
+RE_AttackBuilding.Parent = Remotes
+local RE_MoveTo = Remotes:FindFirstChild("RE_Command_MoveTo") or Instance.new("RemoteEvent")
+RE_MoveTo.Name = "RE_Command_MoveTo"
+RE_MoveTo.Parent = Remotes
+
+local function playerTeamId(plr)
+	if not plr or not plr.Team then return nil end
+	local repName = GameConfig.Teams[2].Name
+	local cisName = GameConfig.Teams[1].Name
+	if plr.Team.Name == repName then return GameConfig.TEAM.REP end
+	if plr.Team.Name == cisName then return GameConfig.TEAM.CIS end
+	return nil
+end
+
+RE_AttackBuilding.OnServerEvent:Connect(function(player, targetModel)
+	if not (okTroops and TroopAIService) then return end
+	if typeof(targetModel) ~= "Instance" then return end
+	local model = targetModel:FindFirstAncestorWhichIsA("Model") or (targetModel:IsA("Model") and targetModel)
+	if not model then return end
+	if not model:GetAttribute("IsBuilding") then return end
+	local tid = playerTeamId(player)
+	if not tid then return end
+	-- Don't allow attacking friendly buildings
+	local ownerTid = model:GetAttribute("OwnerTeam")
+	if ownerTid and ownerTid == tid then return end
+	TroopAIService:OrderAttackTeam(tid, model)
+end)
+
+RE_MoveTo.OnServerEvent:Connect(function(player, position)
+	if not (okTroops and TroopAIService) then return end
+	if typeof(position) ~= "Vector3" then return end
+	local tid = playerTeamId(player)
+	if not tid then return end
+	TroopAIService:OrderMoveTeam(tid, position)
+end)
+
+return CommanderService
