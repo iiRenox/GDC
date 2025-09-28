@@ -1,0 +1,276 @@
+-- ModuleScript
+-- CombatService in ServerScriptService/Services
+-- Verwaltet alle Schadensberechnungen, Resistenzen und Treffererkennung
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local GameConfig = require(ReplicatedStorage.GameConfig)
+local function playerTeamId(plr)
+    if not plr or not plr.Team then return nil end
+    local repName = GameConfig.Teams[2].Name
+    local cisName = GameConfig.Teams[1].Name
+    if plr.Team.Name == repName then return GameConfig.TEAM.REP end
+    if plr.Team.Name == cisName then return GameConfig.TEAM.CIS end
+    return nil
+end
+local serverToAllClientsUpdate = ReplicatedStorage.Remotes.ServerToAllClientsUpdate
+local HeartSystem = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("HeartSystem"))
+local SoundsFolder = ReplicatedStorage:FindFirstChild("Sounds")
+
+local CombatService = {}
+
+local DamageType = {
+    Laser = "Laser",
+    HighImpact = "HighImpact",
+    Beam = "Beam",
+    Tesla = "Tesla",
+    Torpedo = "Torpedo",
+}
+
+local function getBuildingTier(model: Model)
+    local n = model.Name
+    if n:find("_Gold") then return "Gold" end
+    if n:find("_Silver") then return "Silver" end
+    return "Normal"
+end
+
+local function isLaserImmune(model)
+    local tier = getBuildingTier(model)
+    -- Speeder lasers cannot damage Silver or Gold
+    return (tier == "Silver") or (tier == "Gold")
+end
+
+local function isHighImpactImmune(model)
+    local tier = getBuildingTier(model)
+    return tier == "Gold" or false
+end
+
+local function isBeamImmune(model)
+    local tier = getBuildingTier(model)
+    return tier == "Silver" or false
+end
+
+-- Gold laser melt tracking
+local goldExposure = {} -- model -> { sources = set[player or id], since = time }
+local function trackLaserExposure(model, sourceId)
+    goldExposure[model] = goldExposure[model] or { sources = {}, since = nil }
+    goldExposure[model].sources[sourceId] = true
+    if not goldExposure[model].since then goldExposure[model].since = os.clock() end
+end
+
+local function clearLaserExposure(model, sourceId)
+    local g = goldExposure[model]
+    if not g then return end
+    g.sources[sourceId] = nil
+    if next(g.sources) == nil then goldExposure[model] = nil end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.2)
+        local now = os.clock()
+        for model, info in pairs(goldExposure) do
+            if model and model.Parent and info.since and info.sources then
+                local count = 0 for _ in pairs(info.sources) do count += 1 end
+                if count >= 16 and (now - info.since) >= 6 then
+                    local hv = model:FindFirstChild("Health")
+                    if hv and hv:IsA("IntValue") and hv.Value > 0 then
+                        hv.Value = 0
+                    end
+                    goldExposure[model] = nil
+                end
+            else
+                goldExposure[model] = nil
+            end
+        end
+    end
+end)
+
+-- Gold beam melt tracking (single continuous beam ~6s)
+local beamExposure = {} -- model -> { since = number, last = number }
+local function trackBeamExposure(model)
+    local now = os.clock()
+    local t = beamExposure[model]
+    if not t then beamExposure[model] = { since = now, last = now } else t.last = now end
+end
+task.spawn(function()
+    while true do
+        task.wait(0.2)
+        local now = os.clock()
+        for model, t in pairs(beamExposure) do
+            if not (model and model.Parent) then
+                beamExposure[model] = nil
+            else
+                if now - t.last > 0.5 then
+                    beamExposure[model] = nil
+                elseif now - t.since >= 6 then
+                    local hv = model:FindFirstChild("Health")
+                    if hv and hv:IsA("IntValue") and hv.Value > 0 then hv.Value = 0 end
+                    beamExposure[model] = nil
+                end
+            end
+        end
+    end
+end)
+local LASER_RANGE = 250 -- Maximale Reichweite der Speeder-Laser
+local LASER_DAMAGE = 1 -- Schaden pro Treffer (1 Herz)
+local ResourceManager = nil
+
+-- Funktion für alle Arten von Fernkampfangriffen
+function CombatService:HandleRangedAttack(player, originCFrame, attackType)
+    local origin = originCFrame.Position
+    local direction = originCFrame.LookVector
+
+    local raycastParams = RaycastParams.new()
+    local playerCharacter = player.Character
+    raycastParams.FilterDescendantsInstances = {playerCharacter}
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local raycastResult = workspace:Raycast(origin, direction * LASER_RANGE, raycastParams)
+
+    local hitPosition = origin + direction * LASER_RANGE -- Endpunkt, wenn nichts getroffen wird
+
+    if raycastResult then
+        -- Wir haben etwas getroffen!
+        local hitPart = raycastResult.Instance
+        local hitModel = hitPart:FindFirstAncestorWhichIsA("Model")
+        hitPosition = raycastResult.Position -- Der genaue Trefferpunkt
+
+        if hitModel and hitModel:FindFirstChild("Humanoid") then
+            -- Einheit/Spieler
+            local targetHumanoid = hitModel.Humanoid
+            -- Friendly-fire guard for players: don't damage same-team humanoids
+            local targetPlayer = game:GetService("Players"):GetPlayerFromCharacter(hitModel)
+            if targetPlayer then
+                local atkTid = playerTeamId(player)
+                local tgtTid = playerTeamId(targetPlayer)
+                if atkTid and tgtTid and atkTid == tgtTid then
+                    return
+                end
+            end
+            targetHumanoid:TakeDamage(LASER_DAMAGE)
+            local hitS = SoundsFolder and SoundsFolder:FindFirstChild("HitSound")
+            if hitS and hitS:IsA("Sound") then local s = hitS:Clone(); s.Parent = hitPart; s:Play(); game:GetService("Debris"):AddItem(s, 3) end
+
+        elseif hitModel and hitModel:FindFirstChild("Health") then
+            -- Gebäude oder Fahrzeug (mit Health IntValue)
+            local healthValue = hitModel.Health
+            local isBuilding = hitModel:GetAttribute("IsBuilding") == true
+
+            if isBuilding then
+                local atkTid = playerTeamId(player)
+                local ownerTid = hitModel:GetAttribute("OwnerTeam")
+                if not (atkTid and ownerTid and atkTid == ownerTid) then
+                    -- Apply laser respecting tiers
+                    if isLaserImmune(hitModel) then
+                        -- Silver and Gold are immune to speeder lasers
+                    else
+                        healthValue.Value = math.max(0, healthValue.Value - LASER_DAMAGE)
+                    end
+                end
+            else
+                -- Non-building: apply damage
+                healthValue.Value = math.max(0, healthValue.Value - LASER_DAMAGE)
+            end
+
+            local hitS2 = SoundsFolder and SoundsFolder:FindFirstChild("HitSound")
+            if hitS2 and hitS2:IsA("Sound") then local s2 = hitS2:Clone(); s2.Parent = hitPart; s2:Play(); game:GetService("Debris"):AddItem(s2, 3) end
+        end
+
+        -- Impact FX at hit point
+        serverToAllClientsUpdate:FireAllClients("PlayEffect", "LaserImpact", hitPosition)
+    end
+
+    -- Beam FX from origin to final position
+    serverToAllClientsUpdate:FireAllClients("PlayEffect", "LaserBeam", origin, hitPosition)
+end
+
+
+function CombatService:ApplyDamage(source, target, damage, damageType)
+    -- Tiered building handling
+    local model = target
+    if typeof(target) == "Instance" then
+        local m = target:FindFirstAncestorWhichIsA("Model") or (target:IsA("Model") and target)
+        if m then model = m end
+    end
+    -- Humanoid friendly-fire guard for generic calls
+    if typeof(model) == "Instance" and model:IsA("Model") then
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local atkPlr = nil
+            if typeof(source) == "Instance" then
+                atkPlr = game:GetService("Players"):GetPlayerFromCharacter(source) or game:GetService("Players"):GetPlayerFromCharacter(source:FindFirstAncestorWhichIsA("Model"))
+            end
+            local tgtPlr = game:GetService("Players"):GetPlayerFromCharacter(model)
+            if atkPlr and tgtPlr then
+                local a = playerTeamId(atkPlr)
+                local b = playerTeamId(tgtPlr)
+                if a and b and a == b then return end
+            end
+            -- Otherwise, apply raw health damage
+            hum:TakeDamage(damage or 1)
+            return
+        end
+    end
+    if typeof(model) == "Instance" and model:IsA("Model") then
+        local hv = model:FindFirstChild("Health")
+        if hv and hv:IsA("IntValue") then
+            -- Prevent friendly-fire vs buildings (server-side guard)
+            if model:GetAttribute("IsBuilding") then
+                local ownerTid = model:GetAttribute("OwnerTeam")
+                -- Fallback: infer team from model name if attribute missing
+                if not ownerTid and typeof(model.Name) == "string" then
+                    local n = model.Name
+                    if n:find("CIS") then ownerTid = GameConfig.TEAM.CIS
+                    elseif n:find("Rep") then ownerTid = GameConfig.TEAM.REP end
+                end
+                local atkTid = nil
+                if typeof(source) == "Instance" then
+                    local plr = game:GetService("Players"):GetPlayerFromCharacter(source) or game:GetService("Players"):GetPlayerFromCharacter(source:FindFirstAncestorWhichIsA("Model"))
+                    atkTid = playerTeamId(plr)
+                elseif type(source) == "string" or type(source) == "number" then
+                    -- unknown source type; skip team check
+                end
+                if ownerTid and atkTid and ownerTid == atkTid then return end
+            end
+            -- Tesla never damages buildings
+            if damageType == DamageType.Tesla then return end
+            -- Laser: silver immune; gold tracks exposure melt; others take damage
+            if damageType == DamageType.Laser and isLaserImmune(model) then
+                if getBuildingTier(model) == "Gold" and source then
+                    trackLaserExposure(model, tostring(source))
+                end
+                return
+            end
+            if damageType == DamageType.Beam then
+                if isBeamImmune(model) then return end -- Silver immune to beam
+                if getBuildingTier(model) == "Gold" then trackBeamExposure(model); return end
+            end
+            if damageType == DamageType.HighImpact and isHighImpactImmune(model) then return end
+            hv.Value = math.max(0, hv.Value - (damage or 1))
+            return
+        end
+    end
+end
+
+-- Lightweight building damage hook to support regen/Stud drops later
+function CombatService:OnBuildingDestroyed(buildingModel)
+    if not ResourceManager then
+        local ok, mod = pcall(require, script.Parent:FindFirstChild("ResourceManager"))
+        if ok then ResourceManager = mod end
+    end
+    -- Try to infer cost from name and drop 70%
+    local cost = 0
+    local costs = game:GetService("ReplicatedStorage").GameConfig.COSTS
+    if costs then
+        cost = costs[buildingModel.Name] or 0
+    end
+    local drop = math.floor(cost * 0.7)
+    if drop > 0 and ResourceManager then
+        local pivot = buildingModel:GetPivot()
+        ResourceManager:SpawnStuds(pivot.Position, drop, 25)
+    end
+end
+
+CombatService.DamageType = DamageType
+return CombatService

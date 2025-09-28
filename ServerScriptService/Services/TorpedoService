@@ -1,0 +1,111 @@
+-- File: ServerScriptService/Services/TorpedoService
+-- Modified/Created by: GPT-5 (Cursor) — 2025-08-09
+-- Summary: Speeder torpedo pickup and homing to core ball; on impact destroys one random building on that core.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local ServerStorage = game:GetService("ServerStorage")
+local Debris = game:GetService("Debris")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local TorpedoService = {}
+
+local coreIdToLaunchers = {}
+local playerHasTorpedo = {}
+
+local function getCoreBall(coreId: string)
+    -- Expect inside core folder a part named Core_*_*_Ball
+    local map = Workspace:FindFirstChild("Ryloth")
+    if not map then return nil end
+    local coreFolder = map:FindFirstChild(coreId)
+    if not coreFolder then return nil end
+    local coreSub = coreFolder:FindFirstChild(coreId)
+    if coreSub then
+        for _, inst in ipairs(coreSub:GetChildren()) do
+            if inst.Name:find("_Ball") then return inst end
+        end
+    end
+    -- fallback: search any descendant with name *_Ball
+    for _, inst in ipairs(coreFolder:GetDescendants()) do
+        if inst.Name:find("_Ball") then return inst end
+    end
+    return nil
+end
+
+function TorpedoService:RegisterLauncher(coreId: string, plot, model)
+    coreIdToLaunchers[coreId] = coreIdToLaunchers[coreId] or {}
+    table.insert(coreIdToLaunchers[coreId], { plot = plot, model = model })
+    -- Add pickup trigger
+    local pickupPart = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+    if not pickupPart then return end
+    local prompt = Instance.new("ProximityPrompt")
+    prompt.Name = "PickupTorpedo"
+    prompt.ActionText = "Pickup Torpedo"
+    prompt.ObjectText = coreId
+    prompt.KeyboardKeyCode = Enum.KeyCode.E
+    prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+    prompt.HoldDuration = 0.5
+    prompt.MaxActivationDistance = 10
+    prompt.Parent = pickupPart
+    prompt.Triggered:Connect(function(player)
+        playerHasTorpedo[player] = coreId
+    end)
+end
+
+local function spawnHomingTorpedo(player, targetInstance)
+    local part = Instance.new("Part")
+    part.Name = "Torpedo"
+    part.Size = Vector3.new(1,1,2)
+    part.Material = Enum.Material.Neon
+    part.BrickColor = BrickColor.new("New Yeller")
+    part.CanCollide = false
+    part.Anchored = false
+    part.CFrame = player.Character and player.Character:GetPivot() * CFrame.new(0,3,-2) or CFrame.new()
+    part.Parent = Workspace
+    part:SetNetworkOwner(nil)
+    local att = Instance.new("BodyVelocity")
+    att.MaxForce = Vector3.new(1e6,1e6,1e6)
+    att.Velocity = Vector3.new()
+    att.Parent = part
+    Debris:AddItem(part, 12)
+
+    task.spawn(function()
+        local last = os.clock()
+        while part.Parent and targetInstance and targetInstance.Parent do
+            task.wait(0.03)
+            local dt = os.clock() - last; last = os.clock()
+            local pos = part.Position
+            local tPos = targetInstance.Position
+            local dir = (tPos - pos)
+            local dist = dir.Magnitude
+            if dist < 5 then break end
+            dir = dir.Unit
+            local speed = 180
+            att.Velocity = dir * speed
+            part.CFrame = CFrame.lookAt(pos, pos + dir)
+        end
+        -- Impact
+        if part.Parent then
+            part:Destroy()
+        end
+        local BuildManager = require(script.Parent:WaitForChild("BuildManager"))
+        local coreId = playerHasTorpedo[player]
+        if coreId then
+            BuildManager:DestroyRandomBuilding(coreId)
+            playerHasTorpedo[player] = nil
+        end
+    end)
+end
+
+function TorpedoService:Fire(player)
+    local coreId = playerHasTorpedo[player]
+    if not coreId then return end
+    local ball = getCoreBall(coreId)
+    if not ball then return end
+    spawnHomingTorpedo(player, ball)
+end
+
+return TorpedoService
+
+

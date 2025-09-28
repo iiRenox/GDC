@@ -1,0 +1,172 @@
+-- Hauptskript (Script im AT-ST Model) - OHNE Dynamische HipHeight - ANGEPASST FÜR AT-ST GANG
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+-- WICHTIG: Stelle sicher, dass dieses Modul die Version OHNE TweenService ist,
+--          passend zu diesem Hauptskript!
+local ProceduralModule = require(ReplicatedStorage:WaitForChild("ProceduralModule"))
+
+local ATST = script.Parent -- Umbenannt für Klarheit
+local root = ATST:FindFirstChild("HumanoidRootPart")
+local hum = ATST:FindFirstChild("Humanoid")
+local alignOrientation = root:FindFirstChild("AlignOrientation")
+
+local target = Workspace:FindFirstChild("Target")
+
+-- // Konfiguration für AT-ST (Werte anpassen für AT-ST Gefühl!)
+local BASE_HIPHEIGHT = 5           -- FIXE Grundhöhe (WICHTIG: An AT-ST messen/anpassen! 15 könnte zu hoch sein)
+
+local STEP_DISTANCE = 4.5           -- Auslösedistanz (Mittel, nicht zu niedrig)
+local STEP_FORWARD_LENGTH = 3.5     -- Länge des Schritts (Moderate Länge)
+local BASE_STEP_HEIGHT = 5          -- Grundhöhe des Schrittbogens (Moderate Höhe)
+local STEP_WAIT_DURATION = 0.06     -- Dauer der *Pause* im Schrittbogen (Kurz!) im Nicht-Tween-Modul
+local PAUSE_BETWEEN_STEPS = 0.35    -- Pause zwischen den Schritten (Wichtiger für Rhythmus!)
+
+local BODY_TILT_ANGLE = math.rad(7) -- Neigungswinkel (Etwas mehr Wackeln für AT-ST)
+local BODY_TILT_SMOOTHING = 6       -- Wie schnell der Tilt angepasst wird (langsamer = wackeliger)
+
+-- Überprüfe, ob wichtige Teile vorhanden sind
+if not root or not hum or not alignOrientation or not target then
+	warn("ATST Script: Ein oder mehrere notwendige Objekte fehlen (HumanoidRootPart, Humanoid, AlignOrientation, Target). Script wird gestoppt.")
+	return
+end
+
+--// Lade benötigte Beinteile sicher
+local ikTargetsFolder = ATST:WaitForChild("IkTargets", 5)
+local raycastPartsFolder = ATST:WaitForChild("RaycastParts", 5)
+if not ikTargetsFolder or not raycastPartsFolder then
+	warn("FEHLER: IkTargets oder RaycastParts Ordner nicht gefunden!")
+	return
+end
+
+local ikTargets = {}
+local raycastParts = {}
+local ikControls = {}
+local poles = {}
+-- HINWEIS: Diese Namen müssen den Objekten im AT-ST Modell entsprechen!
+--          Wenn deine Beine nicht "LeftBack"/"RightBack" heißen, ändere diese Strings.
+local requiredLegs = {"LeftBack", "RightBack"}
+local allPartsFound = true
+
+print("Überprüfe benötigte Teile für AT-ST...")
+for _, legName in ipairs(requiredLegs) do
+	ikTargets[legName] = ikTargetsFolder:FindFirstChild(legName .. "_IkTarget")
+	raycastParts[legName] = raycastPartsFolder:FindFirstChild(legName .. "_RaycastPart")
+	ikControls[legName] = hum:FindFirstChild(legName .. "_IKControl")
+	poles[legName] = root:FindFirstChild(legName .. "_Pole")
+
+	if not ikTargets[legName] then warn("FEHLER: IK Target '" .. legName .. "_IkTarget' nicht gefunden!"); allPartsFound = false end
+	if not raycastParts[legName] then warn("FEHLER: Raycast Part '" .. legName .. "_RaycastPart' nicht gefunden!"); allPartsFound = false end
+	if not ikControls[legName] then warn("FEHLER: IK Control '" .. legName .. "_IKControl' nicht gefunden!"); allPartsFound = false end
+	if not poles[legName] then warn("FEHLER: Pole '" .. legName .. "_Pole' nicht gefunden!"); allPartsFound = false end
+end
+
+if not allPartsFound then
+	warn("--------------------------------------------------------------------------")
+	warn("ATST Script: Nicht alle benötigten Bein-Komponenten gefunden. Script wird beendet.")
+	warn("Benötigt werden: " .. table.concat(requiredLegs, ", ") .. " (mit _IkTarget, _RaycastPart, _IKControl, _Pole)")
+	warn("--------------------------------------------------------------------------")
+	return
+end
+print("ATST Script: Alle benötigten Teile wurden erfolgreich gefunden.")
+
+-- Weise Poles zu
+for legName, control in pairs(ikControls) do
+	control.Pole = poles[legName]
+	if control.Type ~= Enum.IKControlType.Position then
+		warn("IKControl Type für", legName, "war nicht Position. Setze auf Position.")
+		control.Type = Enum.IKControlType.Position
+	end
+end
+
+--// RaycastParams
+local rayCastParams = RaycastParams.new()
+rayCastParams.FilterDescendantsInstances = {ATST} -- Angepasst
+rayCastParams.FilterType = Enum.RaycastFilterType.Exclude
+rayCastParams.IgnoreWater = true
+
+-- Setze Transparenz für Debugging
+for _, v in pairs(ikTargets) do if v:IsA("BasePart") then v.Transparency = 0 end end
+for _, v in pairs(raycastParts) do if v:IsA("BasePart") then v.Transparency = 0 end end
+for _, v in pairs(poles) do if v:IsA("BasePart") then v.Transparency = 0; v.Size = Vector3.new(1,1,1) end end
+
+-- Initialisiere Humanoid-Eigenschaften
+hum.WalkSpeed = 18 -- Deine gesetzte Geschwindigkeit
+hum.HipHeight = BASE_HIPHEIGHT -- Setze FIXE Höhe EINMALIG hier
+print("ATST HipHeight auf fixen Wert gesetzt:", hum.HipHeight)
+
+-- Bewegung zum Ziel starten
+coroutine.wrap(function()
+	while hum and hum.Parent do
+		hum:MoveTo(target.Position)
+		task.wait(0.25)
+	end
+end)()
+
+-- // Zustand für Body Tilt
+local currentlySteppingLeg = nil -- Welches Bein ist gerade in der Luft?
+local currentBodyTilt = 0 -- Aktueller Neigungswinkel (Radiant)
+
+-- Körperausrichtung UND Body Tilt
+RunService.Heartbeat:Connect(function(deltaTime)
+	if not hum or hum.Health <= 0 then return end
+
+	-- 1. Basis-Körperausrichtung (Boden + Ziel)
+	local baseCFrame = CFrame.identity
+	local bodyRayCast = Workspace:Raycast(root.Position, root.CFrame.UpVector * -1000, rayCastParams)
+	if bodyRayCast then
+		local rotateToFloorCFrame = ProceduralModule:getRotationBetween(root.CFrame.UpVector, bodyRayCast.Normal)
+		local targetLookAt = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
+		local lookAtCFrame = CFrame.lookAt(root.Position, targetLookAt)
+		baseCFrame = rotateToFloorCFrame * lookAtCFrame.Rotation
+	else
+		local targetLookAt = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
+		local lookAtCFrame = CFrame.lookAt(root.Position, targetLookAt)
+		baseCFrame = lookAtCFrame.Rotation
+	end
+
+	-- 2. Body Tilt berechnen
+	local targetTilt = 0
+	if currentlySteppingLeg == "LeftBack" then
+		targetTilt = BODY_TILT_ANGLE -- Linkes Bein in Luft -> Neige nach Rechts
+	elseif currentlySteppingLeg == "RightBack" then
+		targetTilt = -BODY_TILT_ANGLE -- Rechtes Bein in Luft -> Neige nach Links
+	end
+
+	-- 3. Tilt sanft anpassen (Lerp)
+	currentBodyTilt = currentBodyTilt + (targetTilt - currentBodyTilt) * math.min(deltaTime * BODY_TILT_SMOOTHING, 1)
+
+	-- 4. Endgültige Orientierung anwenden (Basis * Tilt)
+	alignOrientation.CFrame = baseCFrame * CFrame.Angles(0, 0, currentBodyTilt) -- Roll um Z-Achse
+
+end)
+
+-- Beinschritt-Schleife für Biped (abwechselnd)
+local nextLeg = "LeftBack" -- Starte mit dem linken Bein
+while ATST.Parent and hum and hum.Health > 0 do -- Angepasst
+
+	if nextLeg == "LeftBack" then
+		currentlySteppingLeg = "LeftBack" -- Setze Zustand für Body Tilt
+		-- Wichtig: Der letzte Parameter ist die *Wartezeit* im Schrittbogen für die NICHT-Tween-Version!
+		ProceduralModule:IkLegStep(ikTargets.LeftBack, raycastParts.LeftBack, root, STEP_DISTANCE, STEP_FORWARD_LENGTH, BASE_STEP_HEIGHT, STEP_WAIT_DURATION, rayCastParams)
+		nextLeg = "RightBack"
+	else -- nextLeg == "RightBack"
+		currentlySteppingLeg = "RightBack" -- Setze Zustand für Body Tilt
+		ProceduralModule:IkLegStep(ikTargets.RightBack, raycastParts.RightBack, root, STEP_DISTANCE, STEP_FORWARD_LENGTH, BASE_STEP_HEIGHT, STEP_WAIT_DURATION, rayCastParams)
+		nextLeg = "LeftBack"
+	end
+
+	-- Warte die definierte Pause, *nachdem* der Schritt gestartet wurde
+	task.wait(PAUSE_BETWEEN_STEPS)
+
+	-- Setze Stepping Leg zurück, damit der Tilt zurückgeht, bevor der nächste Schritt beginnt
+	-- Dies erzeugt mehr Wackeln
+	currentlySteppingLeg = nil
+
+	-- Stoppe, falls sich der Zustand geändert hat
+	if not (ATST.Parent and hum and hum.Health > 0) then break end -- Angepasst
+
+end
+
+print("ATST Script beendet.") -- Angepasst

@@ -1,0 +1,1369 @@
+-- File: ServerScriptService/Services/BuildManager
+-- Modified/Created by: GPT-5 (Cursor) — 2025-08-08
+-- Based on: Gemini scripts — new service
+-- Summary: Scans cores/plots in Workspace.Ryloth, maintains core registry, basic APIs for categories and core status.
+
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local okTorp, TorpedoService = pcall(require, script.Parent:FindFirstChild("TorpedoService"))
+local okTesla, TeslaService = pcall(require, script.Parent:FindFirstChild("TeslaService"))
+local PlayerManager = require(script.Parent:WaitForChild("PlayerManager"))
+
+local BuildManager = {}
+
+-- In-memory state
+local coreIdToCore = {}
+local accumulated = 0
+local regenInterval = 0.25 -- 4 Hz per spec
+local teamUnlockedCategories = {}
+local teamTypeCounts = {}
+local teamCategoryCounts = {}
+-- teamCategoryUnlockCore removed (deprecated)
+
+-- Helpers
+local function log(...)
+    if GameConfig.DEV_MODE then print("[BuildManager]", ...) end
+end
+
+-- Performance guard: disable server-driven arc flicker; clients will still see beams statically.
+local ENABLE_ARC_FLICKER = false
+-- Performance guard: disable all server-side ball hover + FX. Client will animate locally.
+local ENABLE_SERVER_BALL_FX = false
+
+-- Per-building stats lookup (HP and regen), with sensible defaults
+local function getBuildingStats(model: Model)
+    local S = GameConfig.BUILDING_STATS or {}
+    local name = model and model.Name or ""
+    -- getTypeKeyForName may not be defined yet at first load; guard the call
+    local typeKey = model and (model:GetAttribute("TypeKey")) or nil
+    if not typeKey then
+        local resolver = getTypeKeyForName
+        if resolver then
+            typeKey = resolver(name)
+        end
+    end
+    local stats = nil
+    if typeKey and S[typeKey] then stats = S[typeKey] end
+    if not stats and name:find("CommandCenter") and S.CommandCenter then stats = S.CommandCenter end
+    if not stats and S[name] then stats = S[name] end
+    return stats or S.Default or { MaxHP = 1000, RegenPercentPerMin = (GameConfig.DEFAULTS and GameConfig.DEFAULTS.BUILDING_REGEN_RATE) or 0.5 }
+end
+
+-- Server-side helper: point-in-plot (XZ only)
+local function withinPartXZ(part: BasePart, worldPos: Vector3)
+	local localPos = part.CFrame:PointToObjectSpace(worldPos)
+	local halfX = part.Size.X * 0.5
+	local halfZ = part.Size.Z * 0.5
+	return math.abs(localPos.X) <= (halfX + 0.2) and math.abs(localPos.Z) <= (halfZ + 0.2)
+end
+
+-- Any player currently standing on any plot of this core
+local function anyPlayerOnCorePlots(core)
+	if not core or not core.plots then return false end
+	local maxY = (GameConfig.CORE and GameConfig.CORE.MAX_PLOT_PROXIMITY) or 12
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			for _, plot in pairs(core.plots) do
+				local p = plot.part
+				if p and withinPartXZ(p, hrp.Position) and (math.abs(hrp.Position.Y - p.Position.Y) <= maxY) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- Hide plots beyond MAX_BUILDINGS_PER_CORE (keep a deterministic subset by letter)
+local function applyUsablePlotsVisibility(core)
+	if not core or not core.plots then return end
+	local maxUse = (GameConfig.CORE and GameConfig.CORE.MAX_BUILDINGS_PER_CORE) or 3
+	-- Count occupied plots
+	local occupiedCount = 0
+	for _, plot in pairs(core.plots) do
+		if plot.occupied and plot.buildingRef and plot.buildingRef.Parent then occupiedCount += 1 end
+	end
+	local coreIsFull = occupiedCount >= maxUse
+	for letter, plot in pairs(core.plots) do
+		local part = plot.part
+		if part then
+			-- REP command center plot: keep visible when empty to allow rebuilding
+			if part.Name == "BuildPlot_Rep_4_G" then
+				if plot.occupied and plot.buildingRef and plot.buildingRef.Parent then
+					part.Transparency = 0
+					part.CanCollide = true
+					if plot.buildPrompt then plot.buildPrompt.Enabled = false end
+				else
+					part.Transparency = 0
+					part.CanCollide = true
+					if plot.buildPrompt then plot.buildPrompt.Enabled = true end
+				end
+			else
+				if coreIsFull then
+					-- Hide all unoccupied plots; show plots with buildings (so they remain solid)
+					if plot.occupied then
+						part.Transparency = 0
+						part.CanCollide = true
+						if plot.buildPrompt then plot.buildPrompt.Enabled = false end
+					else
+						part.Transparency = 1
+						part.CanCollide = false
+						if plot.buildPrompt then plot.buildPrompt.Enabled = false end
+					end
+				else
+					-- Not full: keep plots visible (server Transparency 0 so client LTM can show 0.8 locally)
+					part.Transparency = 0
+					part.CanCollide = true
+					if plot.buildPrompt then plot.buildPrompt.Enabled = true end
+				end
+			end
+		end
+	end
+end
+
+local function detectSideAndIndex(coreFolder: Instance)
+	-- Expects names like Core_Rep_1 or Core_CIS_3
+	local name = coreFolder.Name
+	local side, idx = nil, nil
+	local rep = name:match("Core_Rep_(%d+)")
+	local cis = name:match("Core_CIS_(%d+)")
+	if rep then side = GameConfig.TEAM.REP; idx = tonumber(rep) end
+	if cis then side = GameConfig.TEAM.CIS; idx = tonumber(cis) end
+	return side, idx
+end
+local function resolvePrefabModel(buildingName: string)
+	local prefabsRoot = ServerStorage:FindFirstChild("BuildingPrefabs")
+	if not (prefabsRoot and buildingName) then return nil end
+	local tryFolders = {}
+	if buildingName:find("^Rep_") then
+		table.insert(tryFolders, prefabsRoot:FindFirstChild("Rep_Buildings"))
+	elseif buildingName:find("^CIS_") then
+		table.insert(tryFolders, prefabsRoot:FindFirstChild("CIS_Buildings"))
+	end
+	-- Always try both sides as fallback
+	table.insert(tryFolders, prefabsRoot:FindFirstChild("Rep_Buildings"))
+	table.insert(tryFolders, prefabsRoot:FindFirstChild("CIS_Buildings"))
+	for _, folder in ipairs(tryFolders) do
+		if folder then
+			local m = folder:FindFirstChild(buildingName)
+			if m and m:IsA("Model") then return m end
+		end
+	end
+	return nil
+end
+
+local function getCategoryForBuildingName(name: string): number
+	-- Normalize common alias (Rey/Ray)
+	local n = name or ""
+	if n:find("ProtonCannon") or n:find("Tesla") then return 1 end
+	if n:find("Support_SmallAir") then return 2 end
+	if n:find("Barracks") then return 3 end
+	if n:find("Support_Air") then return 4 end
+	if n:find("ShieldGen") and not n:find("RayShieldGen") and not n:find("ReyShieldGen") then return 5 end
+	if n:find("RayShieldGen") or n:find("ReyShieldGen") then return 6 end
+	if n:find("Torpedo") then return 7 end
+	if n:find("BitWell") then return 8 end
+	return 8
+end
+
+local function getTypeKeyForName(name: string): string
+	if GameConfig.BUILD_TYPE_ALIASES and GameConfig.BUILD_TYPE_ALIASES[name] then
+		return GameConfig.BUILD_TYPE_ALIASES[name]
+	end
+	local n = name or ""
+	-- New explicit prefab mappings (CIS)
+	if n:find("CIS_Barracks_Rocket_Droid") then return "Barracks_RocketPack" end
+	if n:find("CIS_Barracks_Droid") then return "Barracks_NormalPack" end
+	if n:find("CIS_Support_SmallAir_DroidSpider") then return "DwarfSpider" end
+	if n:find("CIS_Support_Air_SuperTank") then return "Supertank" end
+	if n:find("CIS_Support_Air_AAT") then return "AAT" end
+	if n:find("CIS_Support_Air_HomingSpider") then return "HomingSpider" end
+	if n:find("CIS_Support_Air_HailFire") or n:find("Hailfire") then return "Hailfire" end
+	-- New explicit prefab mappings (REP)
+	if n:find("Rep_Barracks_Rocket_Clone") then return "Barracks_RocketPack" end
+	if n:find("Rep_Barracks_Clone") then return "Barracks_NormalPack" end
+	if n:find("Rep_Support_SmallAir_AT%-RT") then return "ATRT" end
+	if n:find("Rep_Support_Air_AT%-ST") then return "ATST" end
+	if n:find("Rep_Support_Air_LaserTank") then return "LaserTank" end
+	if n:find("Rep_Support_Air_AT%-TE") then return "ATTE" end
+	if n:find("ProtonCannon_Normal") then return "ProtonNormal" end
+	if n:find("ProtonCannon_Silver") then return "ProtonSilver" end
+	if n:find("Tesla_Normal") then return "TeslaNormal" end
+	if n:find("Tesla_Silver") then return "TeslaSilver" end
+	if n:find("Tesla_Gold") then return "TeslaGold" end
+	if n:find("ReyShieldGen_Normal") or n:find("RayShieldGen_Normal") then return "RayShield_Normal" end
+	if n:find("ReyShieldGen_Silver") or n:find("RayShieldGen_Silver") then return "RayShield_Silver" end
+	if n:find("ReyShieldGen_Gold") or n:find("RayShieldGen_Gold") then return "RayShield_Gold" end
+	if n:find("ShieldGen_Normal") then return "Shield_Normal" end
+	if n:find("ShieldGen_Silver") then return "Shield_Silver" end
+	if n:find("ShieldGen_Gold") then return "Shield_Gold" end
+	if n:find("Torpedo_") then return "Torpedo_Normal" end
+	if n:find("Barracks") then return "Barracks_NormalPack" end
+	return n
+end
+
+local function getBuildLimitForType(typeKey: string): number?
+	-- Prefer central config if available
+	if GameConfig.BUILD_LIMITS and typeKey and GameConfig.BUILD_LIMITS[typeKey] then
+		return GameConfig.BUILD_LIMITS[typeKey]
+	end
+	if typeKey == "ProtonNormal" then return 3 end
+	if typeKey == "ProtonSilver" then return 2 end
+	if typeKey == "TeslaNormal" or typeKey == "TeslaSilver" or typeKey == "TeslaGold" then return 1 end
+	return nil
+end
+
+local function gatherBuildingsForTeam(teamId)
+	local prefabsRoot = ServerStorage:FindFirstChild("BuildingPrefabs")
+	if not prefabsRoot then return {} end
+	local teamFolder = (teamId == (GameConfig.TEAM and GameConfig.TEAM.REP)) and prefabsRoot:FindFirstChild("Rep_Buildings") or prefabsRoot:FindFirstChild("CIS_Buildings")
+	if not teamFolder then return {} end
+	local byCat = {}
+	for i = 1, #GameConfig.CATEGORIES do byCat[i] = {} end
+
+	-- Category 1: show each type once (no duplicates in UI)
+	do
+		local prefix = (teamId == (GameConfig.TEAM and GameConfig.TEAM.REP)) and "Rep_" or "CIS_"
+		local c1 = {}
+		table.insert(c1, prefix .. "ProtonCannon_Normal")
+		table.insert(c1, prefix .. "ProtonCannon_Silver")
+		table.insert(c1, prefix .. "Tesla_Normal")
+		table.insert(c1, prefix .. "Tesla_Silver")
+		table.insert(c1, prefix .. "Tesla_Gold")
+		byCat[1] = c1
+	end
+
+	-- Populate other categories from folder; unique per type name
+	local tempCats = {}
+	local seenInCat = {}
+	for _, inst in ipairs(teamFolder:GetChildren()) do
+		if inst:IsA("Model") then
+			local cat = getCategoryForBuildingName(inst.Name)
+			tempCats[cat] = tempCats[cat] or {}
+			seenInCat[cat] = seenInCat[cat] or {}
+			if not seenInCat[cat][inst.Name] then
+				table.insert(tempCats[cat], inst.Name)
+				seenInCat[cat][inst.Name] = true
+			end
+		end
+	end
+	for catIdx=2, #GameConfig.CATEGORIES do
+		local list = tempCats[catIdx] or {}
+		-- Special shaping per category
+		if catIdx == 2 then
+			-- Small Air Support: show the faction-specific vehicle by its name (e.g., AT-RT for REP, DroidSpider for CIS)
+			local filtered = {}
+			for _, nm in ipairs(list) do if nm:find("AT%-RT") or nm:find("DroidSpider") then table.insert(filtered, nm) end end
+			if #filtered > 0 then list = filtered end
+		elseif catIdx == 4 then
+			-- Air Support: keep vehicle names visible; no change, but ensure unique
+			-- list already unique
+		elseif catIdx == 3 then
+			-- Barracks: show normal + rocket variants only
+			local out = {}
+			for _, nm in ipairs(list) do if nm:find("Barracks") then table.insert(out, nm) end end
+			list = out
+		elseif catIdx == 8 then
+			-- Extras: only BitWell
+			local out = {}
+			for _, nm in ipairs(list) do if nm:find("BitWell") then table.insert(out, nm) end end
+			list = out
+		end
+		byCat[catIdx] = list
+	end
+	-- Filter by GameConfig.BUILD_MENU_VISIBLE flags
+	local visible = GameConfig.BUILD_MENU_VISIBLE or {}
+	for i = 1, #byCat do
+		local filtered = {}
+		for _, nm in ipairs(byCat[i]) do
+			local tk = getTypeKeyForName(nm)
+			local vis = visible[tk] -- default nil -> visible
+			if vis ~= false then table.insert(filtered, nm) end
+		end
+		byCat[i] = filtered
+	end
+	return byCat
+end
+
+local function coreBuildingCount(core): number
+	local c = 0
+	for _, p in pairs(core.plots) do
+		if p.occupied and p.buildingRef and p.buildingRef.Parent then c += 1 end
+	end
+	return c
+end
+
+-- Team resolution helper (defined early so all below can call it)
+local function getPlayerTeamId(player)
+	if not player then return nil end
+	if player.Team then
+		local repName = GameConfig.Teams[2].Name
+		local cisName = GameConfig.Teams[1].Name
+		if player.Team.Name == repName then return GameConfig.TEAM.REP end
+		if player.Team.Name == cisName then return GameConfig.TEAM.CIS end
+	end
+	return nil
+end
+
+local function ensureCoreEntry(coreFolder: Instance)
+	local side, idx = detectSideAndIndex(coreFolder)
+	if not side or not idx then return nil end
+	local coreId = coreFolder.Name
+	if not coreIdToCore[coreId] then
+		coreIdToCore[coreId] = {
+			id = coreId,
+			ownerTeam = nil, -- neutral by default; computed dynamically from buildings
+			plots = {},
+			colorRing = nil,
+			commandCenter = coreFolder:FindFirstChild("CommandCenter"),
+			side = side,
+			index = idx,
+			folder = coreFolder,
+		}
+	end
+	return coreIdToCore[coreId]
+end
+
+local function registerPlot(core, plotPart: BasePart)
+	-- BuildPlot_<Side>_<#>_<A..H>
+	local name = plotPart.Name
+	local letter = name:match("BuildPlot_%w+_%d+_([A-H])") or "?"
+	core.plots[letter] = {
+		occupied = false,
+		buildingRef = nil,
+		part = plotPart,
+		originCFrame = plotPart.CFrame * CFrame.new(0, 1.5, 0), -- elevated map ~170; offset 1.5 studs
+		prompt = nil,
+		buildPrompt = nil,
+	}
+	plotPart:SetAttribute("Occupied", false)
+end
+
+local function scanCores()
+	coreIdToCore = {}
+	local mapFolder = Workspace:FindFirstChild("Ryloth")
+	if not mapFolder then warn("[BuildManager] Workspace.Ryloth not found"); return end
+
+	for _, child in ipairs(mapFolder:GetChildren()) do
+		if child:IsA("Folder") and (child.Name:match("^Core_Rep_%d+$") or child.Name:match("^Core_CIS_%d+$")) then
+			local core = ensureCoreEntry(child)
+			if core then
+				-- plots may be direct children or nested; scan descendants for Parts named BuildPlot_*
+				for _, desc in ipairs(child:GetDescendants()) do
+					if desc:IsA("BasePart") and desc.Name:match("^BuildPlot_%w+_%d+_[A-H]$") then
+						registerPlot(core, desc)
+						-- Create SELF-DESTRUCT prompt on matching CoreArm part if present; fallback to plot
+						local letterOnly = desc.Name:match("([A-H])$")
+						local armName = string.format("CoreArm_%s_%d_%s", (core.side == GameConfig.TEAM.REP) and "Rep" or "CIS", core.index, letterOnly)
+						local armPart = core.folder:FindFirstChild(armName, true)
+						if not core.plots[letterOnly].prompt then
+							local prompt = Instance.new("ProximityPrompt")
+							prompt.Name = "SelfDestructPrompt"
+							prompt.ActionText = "Self-Destruct Building"
+							prompt.ObjectText = core.id .. " / Plot " .. letterOnly
+							prompt.KeyboardKeyCode = Enum.KeyCode.E
+							prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+							prompt.HoldDuration = 1.2
+							prompt.RequiresLineOfSight = false
+							prompt.MaxActivationDistance = 12
+							prompt.Parent = armPart or desc
+							core.plots[letterOnly].prompt = prompt
+						end
+
+						-- Create BUILD prompt on plot
+						if not core.plots[letterOnly].buildPrompt then
+							local bp = Instance.new("ProximityPrompt")
+							bp.Name = "BuildPrompt"
+							bp.ActionText = "Open Build Menu"
+							bp.ObjectText = core.id .. " / Plot " .. letterOnly
+							bp.KeyboardKeyCode = Enum.KeyCode.F
+							bp.GamepadKeyCode = Enum.KeyCode.ButtonY
+							bp.HoldDuration = 0
+							bp.RequiresLineOfSight = false
+							bp.MaxActivationDistance = 24
+							bp.Parent = desc
+							core.plots[letterOnly].buildPrompt = bp
+						end
+					end
+				end
+				log("Registered core", core.id, "plots=", (function()
+					local c=0; for _ in pairs(core.plots) do c+=1 end; return c end)())
+			end
+		end
+	end
+end
+
+local function ensureTeamTables()
+	for _, tid in ipairs({ GameConfig.TEAM and GameConfig.TEAM.REP or 2, GameConfig.TEAM and GameConfig.TEAM.CIS or 1 }) do
+		if tid then
+			teamUnlockedCategories[tid] = teamUnlockedCategories[tid] or {}
+			if next(teamUnlockedCategories[tid]) == nil then
+				for i = 1, #GameConfig.CATEGORIES do teamUnlockedCategories[tid][i] = false end
+			end
+			teamTypeCounts[tid] = teamTypeCounts[tid] or {}
+			teamCategoryCounts[tid] = teamCategoryCounts[tid] or {}
+			-- teamCategoryUnlockCore deprecated
+			for i = 1, #GameConfig.CATEGORIES do
+				if teamCategoryCounts[tid][i] == nil then teamCategoryCounts[tid][i] = 0 end
+			end
+		end
+	end
+end
+
+-- Progression helpers per new rules
+local function coreIsEmpty(core)
+	return coreBuildingCount(core) == 0
+end
+
+-- Emptiness for progression purposes: ignore CommandCenter presence
+local function coreIsEmptyForProgression(core)
+	if not core then return true end
+	for _, p in pairs(core.plots) do
+		local m = p.buildingRef
+		if m and m.Parent and (not string.find(m.Name, "CommandCenter")) then
+			return false
+		end
+	end
+	return true
+end
+
+-- Compute dynamic ownership: any CIS building -> CIS; else any REP building -> REP; else neutral
+local function recomputeCoreOwnership(core)
+	if not core then return end
+	local repCount, cisCount = 0, 0
+	for _, p in pairs(core.plots) do
+		local m = p.buildingRef
+		if m and m.Parent then
+			local ot = m:GetAttribute("OwnerTeam")
+			if not ot then
+				-- Fallback by name prefix
+				if tostring(m.Name):find("^Rep_") then ot = GameConfig.TEAM.REP
+				elseif tostring(m.Name):find("^CIS_") then ot = GameConfig.TEAM.CIS end
+			end
+			if ot == GameConfig.TEAM.REP then repCount += 1 end
+			if ot == GameConfig.TEAM.CIS then cisCount += 1 end
+		end
+	end
+	local newOwner = nil
+	if repCount == 0 and cisCount == 0 then
+		newOwner = nil
+	elseif repCount > 0 and cisCount == 0 then
+		newOwner = GameConfig.TEAM.REP
+	elseif cisCount > 0 and repCount == 0 then
+		newOwner = GameConfig.TEAM.CIS
+	else
+		-- Both present; choose majority, else keep prior owner for stability
+		if repCount > cisCount then newOwner = GameConfig.TEAM.REP
+		elseif cisCount > repCount then newOwner = GameConfig.TEAM.CIS
+		else newOwner = core.ownerTeam end
+	end
+	core.contested = (repCount > 0 and cisCount > 0)
+	if core.ownerTeam ~= newOwner then
+		core.ownerTeam = newOwner
+		-- visuals updated outside via updateCoreVisuals
+	end
+end
+
+-- Forward declaration for FX helper
+local ensureCoreBallFX
+
+-- Create/update a neon ring above the plate to show ownership; hidden when neutral
+local function updateCoreVisuals(core)
+	if not core or not core.folder then return end
+	local plate
+	-- Try canonical plate name first
+	local sideName = (core.side == GameConfig.TEAM.REP) and "Rep" or "CIS"
+	plate = core.folder:FindFirstChild(string.format("Core_%s_%d_Plate", sideName, core.index), true)
+	if not (plate and plate:IsA("BasePart")) then
+		-- Fallback: find any descendant named *Plate within core folder
+		for _, d in ipairs(core.folder:GetDescendants()) do
+			if d:IsA("BasePart") and tostring(d.Name):find("Plate") then plate = d break end
+		end
+	end
+	if not (plate and plate:IsA("BasePart")) then
+		-- Global fallback in Workspace.Ryloth
+		local mapFolder = Workspace:FindFirstChild("Ryloth")
+		if mapFolder then
+			local targetName = string.format("Core_%s_%d_Plate", sideName, core.index)
+			for _, d in ipairs(mapFolder:GetDescendants()) do
+				if d:IsA("BasePart") and d.Name == targetName then plate = d break end
+			end
+		end
+	end
+	if not (plate and plate:IsA("BasePart")) then return end
+	-- Use preplaced ring part inside the core folder: Ring_Core_<Rep|CIS>_<index>
+	local ringName = string.format("Ring_Core_%s_%d", sideName, core.index)
+	local ring = core.folder:FindFirstChild(ringName, true)
+	local hasRing = (ring and ring:IsA("BasePart"))
+	-- Determine presence: players actually on a plot surface
+	local hasPresence = anyPlayerOnCorePlots(core)
+	-- Apply color/transparency rules
+	if hasRing then
+		ring.CanCollide = false
+		if not core.ownerTeam then
+			if coreIsEmpty(core) and hasPresence then
+				-- purple presence hint when empty
+				ring.Color = Color3.fromRGB(87, 4, 139)
+				ring.Transparency = 0.70
+			else
+				ring.Transparency = 1
+			end
+		else
+			if core.ownerTeam == GameConfig.TEAM.REP then
+				ring.Color = Color3.fromRGB(36, 22, 229)
+			else
+				ring.Color = Color3.fromRGB(151, 0, 0)
+			end
+			ring.Transparency = 0.85
+		end
+	end
+	if ENABLE_SERVER_BALL_FX then
+		ensureCoreBallFX(core)
+		-- Manage ball hover state: rest on plate if core empty and no presence; else hover
+		local shouldHover = (not coreIsEmpty(core)) or hasPresence
+		local fx = core.fxBall
+		if fx then
+			if fx.beam then fx.beam.Enabled = shouldHover end
+			if fx.arcs then for _,a in ipairs(fx.arcs) do a.Enabled = shouldHover end end
+			if fx.particle then fx.particle.Enabled = shouldHover end
+			if shouldHover and not fx.bobbingActive then
+				fx.bobbingActive = false -- force restart
+				if fx.bobTween then pcall(function() fx.bobTween:Cancel() end) end
+				fx.bobTween = nil
+			elseif (not shouldHover) and fx.bobbingActive then
+				-- Stop tween and place ball on plate
+				fx.bobbingActive = false
+				if fx.bobTween then pcall(function() fx.bobTween:Cancel() end) end
+				fx.bobTween = nil
+				local plateY = plate.Position.Y + (fx.ball.Size.Y * 0.5)
+				fx.baseCFrame = CFrame.new(Vector3.new(plate.Position.X, plateY, plate.Position.Z))
+				fx.ball.CFrame = fx.baseCFrame
+			end
+		end
+		if shouldHover then ensureCoreBallFX(core) end
+	end
+end
+
+-- Ensure Ball FX (beam + hover) exists for a core
+ensureCoreBallFX = function(core)
+	if not ENABLE_SERVER_BALL_FX then return end
+	if not core or not core.folder then return end
+	-- Find plate (reuse logic)
+	local plate
+	local sideName = (core.side == GameConfig.TEAM.REP) and "Rep" or "CIS"
+	plate = core.folder:FindFirstChild(string.format("Core_%s_%d_Plate", sideName, core.index), true)
+	if not (plate and plate:IsA("BasePart")) then
+		for _, d in ipairs(core.folder:GetDescendants()) do
+			if d:IsA("BasePart") and tostring(d.Name):find("Plate") then plate = d break end
+		end
+	end
+	if not (plate and plate:IsA("BasePart")) then return end
+
+	-- Find ball (Ball or Bal)
+	local ball = core.folder:FindFirstChild(string.format("Core_%s_%d_Ball", sideName, core.index), true)
+	if not (ball and ball:IsA("BasePart")) then
+		ball = core.folder:FindFirstChild(string.format("Core_%s_%d_Bal", sideName, core.index), true)
+	end
+	if not (ball and ball:IsA("BasePart")) then return end
+
+	core.fxBall = core.fxBall or {}
+	local fx = core.fxBall
+	if not fx.attPlate then
+		fx.attPlate = Instance.new("Attachment")
+		fx.attPlate.Name = "FX_Att_Plate"
+		fx.attPlate.Parent = plate
+	end
+	if not fx.attBall then
+		fx.attBall = Instance.new("Attachment")
+		fx.attBall.Name = "FX_Att_Ball"
+		fx.attBall.Parent = ball
+	end
+	if not fx.beam then
+		fx.beam = Instance.new("Beam")
+		fx.beam.Name = "FX_CoreBeam"
+		fx.beam.Attachment0 = fx.attPlate
+		fx.beam.Attachment1 = fx.attBall
+		fx.beam.Color = ColorSequence.new(Color3.fromRGB(200, 240, 255))
+		fx.beam.Width0 = 0.35
+		fx.beam.Width1 = 0.35
+		fx.beam.Brightness = 3
+		fx.beam.Transparency = NumberSequence.new(0.05)
+		fx.beam.FaceCamera = true
+		fx.beam.Parent = plate
+	end
+	-- Add multiple arc beams from plate rim to ball (flickering lightning look)
+	if not fx.rimAtts then
+		fx.rimAtts = {}
+		local rimRadius = math.max(plate.Size.X, plate.Size.Z) * 0.45
+		for i = 1, 6 do
+			local att = Instance.new("Attachment")
+			att.Name = string.format("FX_Att_Rim_%d", i)
+			local angle = (i / 6) * math.pi * 2
+			local offset = Vector3.new(math.cos(angle) * rimRadius, 0.2, math.sin(angle) * rimRadius)
+			att.Position = offset
+			att.Parent = plate
+			table.insert(fx.rimAtts, att)
+		end
+	end
+	if not fx.arcs then
+		fx.arcs = {}
+		for i, att in ipairs(fx.rimAtts) do
+			local b = Instance.new("Beam")
+			b.Name = string.format("FX_Arc_%d", i)
+			b.Attachment0 = att
+			b.Attachment1 = fx.attBall
+			b.Color = ColorSequence.new(Color3.fromRGB(180, 220, 255))
+			b.Width0 = 0.15
+			b.Width1 = 0.05
+			b.Brightness = 2
+			b.Transparency = NumberSequence.new(0.2)
+			b.FaceCamera = false
+			b.CurveSize0 = math.random(-2, 2)
+			b.CurveSize1 = math.random(-2, 2)
+			b.Parent = plate
+			table.insert(fx.arcs, b)
+		end
+	end
+	if ENABLE_ARC_FLICKER and not fx.arcsTask then
+		fx.arcsTask = task.spawn(function()
+			while core and core.folder and fx.ball and fx.ball.Parent do
+				if fx.bobbingActive then
+					-- Randomly flicker a subset of arcs
+					for _, arc in ipairs(fx.arcs or {}) do
+						arc.Enabled = (math.random() < 0.5)
+						arc.CurveSize0 = math.random(-3, 3)
+						arc.CurveSize1 = math.random(-3, 3)
+						arc.Width0 = 0.12 + math.random() * 0.10
+						arc.Width1 = 0.04 + math.random() * 0.06
+					end
+					task.wait(0.12 + math.random() * 0.08)
+				else
+					-- Not hovering: keep arcs disabled and sleep longer
+					for _, arc in ipairs(fx.arcs or {}) do arc.Enabled = false end
+					task.wait(0.25)
+				end
+			end
+			fx.arcsTask = nil
+		end)
+	end
+	if not fx.particle then
+		fx.particle = Instance.new("ParticleEmitter")
+		fx.particle.Name = "FX_Lightning"
+		fx.particle.Texture = ""
+		fx.particle.Rate = 12
+		fx.particle.Speed = NumberRange.new(0.5, 1.5)
+		fx.particle.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 0.05)})
+		fx.particle.Lifetime = NumberRange.new(0.3, 0.5)
+		fx.particle.LightEmission = 1
+		fx.particle.Color = ColorSequence.new(Color3.fromRGB(200, 240, 255))
+		fx.particle.Parent = ball
+	end
+	fx.ball = ball
+	fx.plate = plate
+	fx.baseCFrame = fx.baseCFrame or ball.CFrame
+	fx.t0 = fx.t0 or os.clock()
+
+	-- Start TweenService-based bobbing + rotation once (relative to baseCFrame)
+	if not fx.bobbingActive then
+		fx.bobbingActive = true
+		fx.bobDir = fx.bobDir or 1
+		fx.bobHeight = fx.bobHeight or 3.5
+		fx.spinAngle = fx.spinAngle or 0
+		if not fx.ball.Anchored then
+			-- Ensure stable tweening for decorative FX
+			pcall(function()
+				fx.ball.Anchored = true
+			end)
+		end
+		local function step()
+			if not (fx.ball and fx.ball.Parent and fx.baseCFrame) then
+				fx.bobbingActive = false
+				return
+			end
+			local dir = fx.bobDir
+			local height = fx.bobHeight
+			local newAngle = (fx.spinAngle + 90) % 360
+			local target = fx.baseCFrame * CFrame.new(0, dir * height, 0) * CFrame.Angles(0, math.rad(newAngle), 0)
+			local tw = TweenService:Create(fx.ball, TweenInfo.new(1.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { CFrame = target })
+			fx.bobTween = tw
+			tw.Completed:Connect(function()
+				fx.bobDir = -fx.bobDir
+				fx.spinAngle = newAngle
+				step()
+			end)
+			tw:Play()
+		end
+		step()
+	end
+end
+
+local function computeAvailableCategoriesForTeamOnCore(teamId, core)
+	ensureTeamTables()
+	local n = #GameConfig.CATEGORIES
+	local arr = table.create(n, false)
+	-- Category 1 is not always unlocked. It is unlocked only if presence exists; but on an empty core, we allow the next highest to show which may be cat 1 itself.
+	if not teamId then return arr end
+	local counts = teamCategoryCounts[teamId] or {}
+	-- Permanent unlocks are driven by presence counts in a continuous chain from 1..n
+	local highestPermanent = 0
+	if (counts[1] or 0) > 0 then arr[1] = true; highestPermanent = 1 end
+	for i = 2, n do
+		if (counts[i] or 0) > 0 and arr[i - 1] then
+			arr[i] = true
+			highestPermanent = i
+		end
+	end
+	-- Allow the next highest category to show when the current core is empty (this can be cat 1 if highestPermanent==0)
+	if core and coreIsEmptyForProgression(core) and highestPermanent < n then
+		arr[highestPermanent + 1] = true
+	end
+	return arr
+end
+
+local function ensureHealthBar(model: Model)
+	local pp = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not pp then return end
+	local existing = pp:FindFirstChild("HealthBillboard")
+	if existing then return end
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "HealthBillboard"
+	bb.Size = UDim2.new(0, 64, 0, 10)
+	bb.StudsOffset = Vector3.new(0, 5, 0)
+	bb.AlwaysOnTop = true
+	bb.LightInfluence = 0
+	bb.Enabled = false
+	bb.Parent = pp
+	local frame = Instance.new("Frame")
+	frame.Name = "Back"
+	frame.BackgroundColor3 = Color3.fromRGB(20,20,20)
+	frame.BackgroundTransparency = 0.4
+	frame.Size = UDim2.fromScale(1,1)
+	frame.BorderSizePixel = 0
+	frame.Parent = bb
+	local bar = Instance.new("Frame")
+	bar.Name = "Bar"
+	bar.BackgroundColor3 = Color3.fromRGB(255,60,60)
+	bar.BorderSizePixel = 0
+	bar.Size = UDim2.fromScale(1,1)
+	bar.Parent = frame
+end
+
+local function updateHealthBar(model: Model, hp: number, maxHp: number)
+	local pp = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not pp then return end
+	local bb = pp:FindFirstChild("HealthBillboard")
+	if not bb or not bb:IsA("BillboardGui") then return end
+	local bar = bb:FindFirstChild("Back") and bb.Back:FindFirstChild("Bar")
+	if not bar then return end
+	local pct = 1
+	if maxHp > 0 then pct = math.clamp(hp/maxHp, 0, 1) end
+	bar.Size = UDim2.fromScale(pct, 1)
+	bb.Enabled = pct < 1
+end
+
+local SoundsFolder = ReplicatedStorage:FindFirstChild("Sounds")
+
+local function explodeAndDespawn(model: Model)
+	-- Unanchor all parts and add small random impulse; then despawn
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Anchored = false
+			part.CanCollide = true
+			part.AssemblyLinearVelocity = part.AssemblyLinearVelocity + Vector3.new(math.random(-40,40), math.random(20,45), math.random(-40,40))
+		end
+	end
+	-- Visual boom
+	local pivot = model:GetPivot()
+	local explosion = Instance.new("Explosion")
+	explosion.Position = pivot.Position
+	explosion.BlastRadius = 12
+	explosion.BlastPressure = 200000
+	explosion.DestroyJointRadiusPercent = 0
+	explosion.Parent = Workspace
+	-- Audio boom
+	local boom = SoundsFolder and SoundsFolder:FindFirstChild("BuildingExplosion")
+	if boom and boom:IsA("Sound") then local s = boom:Clone(); s.Parent = Workspace; s.SoundGroup = boom.SoundGroup; s.TimePosition = 0; s.PlayOnRemove = false; s:Play(); game:GetService("Debris"):AddItem(s, 5) end
+	task.delay(6, function()
+		if model and model.Parent then model:Destroy() end
+	end)
+end
+
+local function onBuildingDestroyed(core, plot, model)
+	if model:GetAttribute("BD_DroppedStuds") then return end
+	model:SetAttribute("BD_DroppedStuds", true)
+	-- Drop Bits (70% of cost) resolving from known name patterns
+	local cost = 0
+	if GameConfig.COSTS then
+		local n = model.Name
+		if n:find("BitWell") then cost = GameConfig.COSTS.BitWell or 0
+		elseif n:find("ProtonCannon_Normal") then cost = GameConfig.COSTS.ProtonNormal or 0
+		elseif n:find("ProtonCannon_Silver") then cost = GameConfig.COSTS.ProtonSilver or 0
+		elseif n:find("Tesla_Normal") then cost = GameConfig.COSTS.TeslaNormal or 0
+		elseif n:find("Tesla_Silver") then cost = GameConfig.COSTS.TeslaSilver or 0
+		elseif n:find("Tesla_Gold") then cost = GameConfig.COSTS.TeslaGold or 0
+		elseif n:find("Torpedo_") then cost = GameConfig.COSTS.Torpedo_Normal or GameConfig.COSTS.TorpedoNormal or 0
+		elseif n:find("Barracks") then
+			local var = model:GetAttribute("Variant")
+			if var == "Rocket" then cost = GameConfig.COSTS.Barracks_RocketPack or 0 else cost = GameConfig.COSTS.Barracks_NormalPack or 0 end
+		else
+			-- Try alias/variant resolution via typeKey
+			local typeKey = model:GetAttribute("TypeKey") or getTypeKeyForName(n)
+			cost = (typeKey and GameConfig.COSTS[typeKey]) or GameConfig.COSTS[n] or 0
+		end
+	end
+	if cost <= 0 then cost = 1000 end
+	local toDrop = math.floor(cost * 0.7)
+	local ok, ResourceManager = pcall(require, script.Parent:FindFirstChild("ResourceManager"))
+	if ok and ResourceManager and toDrop > 0 then
+		local pv = model:GetPivot()
+		ResourceManager:SpawnStuds(pv.Position, toDrop, 25)
+	end
+	-- Update team counters before freeing the plot
+	local ownerTeam = model:GetAttribute("OwnerTeam") or core.ownerTeam
+	local typeKey = model:GetAttribute("TypeKey") or getTypeKeyForName(model.Name)
+	local catId = getCategoryForBuildingName(model.Name)
+	if ownerTeam then
+		ensureTeamTables()
+		teamTypeCounts[ownerTeam][typeKey] = math.max(0, (teamTypeCounts[ownerTeam][typeKey] or 0) - 1)
+		teamCategoryCounts[ownerTeam][catId] = math.max(0, (teamCategoryCounts[ownerTeam][catId] or 0) - 1)
+		if teamCategoryCounts[ownerTeam][catId] == 0 then
+			-- No direct mutation to unlocked; visibility is computed dynamically from counts and core emptiness
+		end
+	end
+	-- Win condition: if a CommandCenter is destroyed (by damage or self-destruct)
+	if string.find(model.Name, "CommandCenter") then
+		local okWin, WinService = pcall(require, script.Parent:FindFirstChild("WinService"))
+		if okWin and WinService and WinService.OnCommandCenterDestroyed then
+			local destroyedTeam = nil
+			if string.find(model.Name, "Rep") then
+				destroyedTeam = GameConfig.TEAM.REP
+			elseif string.find(model.Name, "CIS") then
+				destroyedTeam = GameConfig.TEAM.CIS
+			end
+			if destroyedTeam then pcall(function() WinService:OnCommandCenterDestroyed(destroyedTeam) end) end
+		end
+	end
+	-- Free plot after despawn
+	explodeAndDespawn(model)
+	task.delay(6.1, function()
+		plot.occupied = false
+		plot.buildingRef = nil
+		if plot.part then plot.part:SetAttribute("Occupied", false) end
+		-- Recompute ownership and visuals after despawn
+		recomputeCoreOwnership(core)
+		updateCoreVisuals(core)
+		if applyUsablePlotsVisibility then applyUsablePlotsVisibility(core) end
+	end)
+end
+
+local function setupBuilding(core, plot)
+	local model = plot.buildingRef
+	if not model or not model.Parent then return end
+	model:SetAttribute("IsBuilding", true)
+	ensureHealthBar(model)
+	local hv = model:FindFirstChild("Health")
+	if hv and hv:IsA("IntValue") then
+		hv:SetAttribute("Max", hv:GetAttribute("Max") or hv.Value)
+		updateHealthBar(model, hv.Value, hv:GetAttribute("Max"))
+		local prev = hv.Value
+		hv.Changed:Connect(function()
+			local maxHp = hv:GetAttribute("Max") or hv.Value
+			updateHealthBar(model, hv.Value, maxHp)
+			if hv.Value < prev then
+				model:SetAttribute("LastDamagedAt", os.clock())
+			end
+			prev = hv.Value
+			if hv.Value <= 0 then
+				onBuildingDestroyed(core, plot, model)
+			end
+		end)
+	end
+	-- Register special buildings
+	if okTorp and TorpedoService then
+		if string.find(model.Name, "Torpedo") then
+			TorpedoService:RegisterLauncher(core.id, plot, model)
+		end
+	end
+	if okTesla and TeslaService then
+		if string.find(model.Name, "Tesla") then
+			TeslaService:RegisterTesla(core.id, plot, model, core.ownerTeam)
+		end
+	end
+end
+
+-- API
+function BuildManager:Init()
+	scanCores()
+	ensureTeamTables()
+	-- Place designated Command Centers if missing
+	task.defer(function()
+		-- Locate the specific plots by exact names
+		local targets = { CIS = "BuildPlot_CIS_4_C", REP = "BuildPlot_Rep_4_G" }
+		local nameToPrefab = { CIS = "CIS_CommandCenter", REP = "Rep_CommandCenter" }
+		for _, core in pairs(coreIdToCore) do
+			for letter, plot in pairs(core.plots) do
+				if plot.part and (plot.part.Name == targets.CIS or plot.part.Name == targets.REP) then
+					if not plot.occupied then
+						local sideKey = (plot.part.Name:find("^BuildPlot_Rep_")) and "REP" or "CIS"
+						local prefabName = nameToPrefab[sideKey]
+						local ok = self:PlaceBuilding(prefabName, core.id, letter)
+						if ok then
+							-- Assign owner team and mark occupied attribute
+							local t = (sideKey == "REP") and GameConfig.TEAM.REP or GameConfig.TEAM.CIS
+							if plot.buildingRef then plot.buildingRef:SetAttribute("OwnerTeam", t) end
+							if plot.part then plot.part:SetAttribute("Occupied", true) end
+							recomputeCoreOwnership(core)
+							updateCoreVisuals(core)
+						end
+					end
+				end
+			end
+			-- Ensure visuals reflect current ownership state
+			recomputeCoreOwnership(core)
+			updateCoreVisuals(core)
+			if applyUsablePlotsVisibility then applyUsablePlotsVisibility(core) end
+		end
+	end)
+	-- Regen loop at 4 Hz
+	RunService.Heartbeat:Connect(function(dt)
+		accumulated += dt
+		if accumulated < regenInterval then return end
+		accumulated = 0
+		for _, core in pairs(coreIdToCore) do
+			for _, plot in pairs(core.plots) do
+				local model = plot.buildingRef
+				if model and model.Parent then
+					local hv = model:FindFirstChild("Health")
+					if hv and hv:IsA("IntValue") then
+						local stats = getBuildingStats(model)
+						local maxHp = hv:GetAttribute("Max") or (stats and stats.MaxHP) or hv.Value
+						local isCC = string.find(model.Name, "CommandCenter") ~= nil
+						local ratePerMin = (stats and stats.RegenPercentPerMin) or (GameConfig.DEFAULTS and GameConfig.DEFAULTS.BUILDING_REGEN_RATE) or 0.5
+						-- Regen cooldown: normally block 5s after damage; CC or NoCooldown ignores cooldown
+						local last = model:GetAttribute("LastDamagedAt")
+						local now = os.clock()
+						local noCooldown = (stats and stats.NoCooldown) or isCC
+						local regenBlocked = (not noCooldown) and last and (now - last) < 5
+						if hv.Value > 0 and hv.Value < maxHp then
+							if not regenBlocked then
+								local perSecond = (ratePerMin / 100) * maxHp / 60
+								local delta = math.max(1, math.floor(perSecond * (1/regenInterval)))
+								hv.Value = math.min(maxHp, hv.Value + delta)
+							end
+						end
+					end
+				end
+			end
+			-- Refresh presence-based visuals (rings/purple/hover) even without build changes
+			updateCoreVisuals(core)
+		end
+	end)
+end
+
+function BuildManager:GetCore(coreId: string)
+	return coreIdToCore[coreId]
+end
+
+function BuildManager:GetCoreStatus(coreId: string)
+	local core = coreIdToCore[coreId]
+	if not core then return nil end
+	-- For now, compute HP by buildings with Health value; later include shields, etc.
+	local totalHp, totalMax = 0, 0
+	for _, plot in pairs(core.plots) do
+		if plot.buildingRef then
+			local hv = plot.buildingRef:FindFirstChild("Health")
+			if hv and hv:IsA("IntValue") then
+				totalHp += hv.Value
+				totalMax += hv:GetAttribute("Max") or hv.Value
+			end
+		end
+	end
+	local percent = 100
+	if totalMax > 0 then percent = math.clamp((totalHp/totalMax)*100, 0, 100) end
+	return { ownerTeam = core.ownerTeam, totalHPPercent = percent, shieldsActive = false }
+end
+
+function BuildManager:DestroyRandomBuilding(coreId: string)
+	local core = coreIdToCore[coreId]
+	if not core then return false end
+	local letters = {}
+	for letter, plot in pairs(core.plots) do
+		if plot.occupied and plot.buildingRef and plot.buildingRef.Parent then table.insert(letters, letter) end
+	end
+	if #letters == 0 then return false end
+	local idx = math.random(1, #letters)
+	local plot = core.plots[letters[idx]]
+	local model = plot.buildingRef
+	local hv = model:FindFirstChild("Health")
+	if hv and hv:IsA("IntValue") then hv.Value = 0 else model:Destroy() end
+	return true
+end
+
+function BuildManager:GetAvailableCategoriesForPlayer(player: Player, coreId: string)
+	ensureTeamTables()
+	local tid = getPlayerTeamId(player)
+	local core = coreIdToCore[coreId]
+	local arr = computeAvailableCategoriesForTeamOnCore(tid, core)
+	if tid then teamUnlockedCategories[tid] = arr end
+	return arr
+end
+
+-- Attempt to purchase and place a building on a plot
+-- payload: player, coreId, plotLetter, buildingName (prefab name under side folder)
+local function getCostKeyForPrefab(prefabName: string): string?
+	if not prefabName then return nil end
+	if string.find(prefabName, "BitWell") then return "BitWell" end
+	if string.find(prefabName, "Barracks_Rocket") then return "Barracks_RocketPack" end
+	if string.find(prefabName, "Barracks") then return "Barracks_NormalPack" end
+	-- CIS explicit
+	if prefabName:find("CIS_Support_SmallAir_DroidSpider") then return "DwarfSpider" end
+	if prefabName:find("CIS_Support_Air_SuperTank") then return "Supertank" end
+	if prefabName:find("CIS_Support_Air_AAT") then return "AAT" end
+	if prefabName:find("CIS_Support_Air_HomingSpider") then return "HomingSpider" end
+	if prefabName:find("CIS_Support_Air_HailFire") or prefabName:find("Hailfire") then return "Hailfire" end
+	-- REP explicit
+	if prefabName:find("Rep_Support_SmallAir_AT%-RT") then return "ATRT" end
+	if prefabName:find("Rep_Support_Air_AT%-ST") then return "ATST" end
+	if prefabName:find("Rep_Support_Air_LaserTank") then return "LaserTank" end
+	if prefabName:find("Rep_Support_Air_AT%-TE") then return "ATTE" end
+	-- Shields
+	if prefabName:find("ShieldGen_Normal") then return "Shield_Normal" end
+	if prefabName:find("ShieldGen_Silver") then return "Shield_Silver" end
+	if prefabName:find("ShieldGen_Gold") then return "Shield_Gold" end
+	-- Ray Shields (alias Rey)
+	if prefabName:find("ReyShieldGen_Normal") or prefabName:find("RayShieldGen_Normal") then return "RayShield_Normal" end
+	if prefabName:find("ReyShieldGen_Silver") or prefabName:find("RayShieldGen_Silver") then return "RayShield_Silver" end
+	if prefabName:find("ReyShieldGen_Gold") or prefabName:find("RayShieldGen_Gold") then return "RayShield_Gold" end
+	if string.find(prefabName, "ProtonCannon_Normal") then return "ProtonNormal" end
+	if string.find(prefabName, "ProtonCannon_Silver") then return "ProtonSilver" end
+	if string.find(prefabName, "Tesla_Normal") then return "TeslaNormal" end
+	if string.find(prefabName, "Tesla_Silver") then return "TeslaSilver" end
+	if string.find(prefabName, "Tesla_Gold") then return "TeslaGold" end
+	-- Torpedo variants
+	if string.find(prefabName, "Torpedo_Gold") then return "Torpedo_Gold" end
+	if string.find(prefabName, "Torpedo_Silver") then return "Torpedo_Silver" end
+	if string.find(prefabName, "Torpedo_") then return "Torpedo_Normal" end
+	return nil
+end
+
+function BuildManager:AttemptPurchase(player: Player, coreId: string, plotLetter: string, buildingName: string, variant: string?)
+	local core = coreIdToCore[coreId]
+	if not (player and core and type(plotLetter) == "string" and type(buildingName) == "string") then
+		return false, "InvalidInput"
+	end
+	local plot = core.plots[plotLetter]
+	if not plot then return false, "InvalidPlot" end
+	if plot.occupied then return false, "Occupied" end
+
+	-- Proximity validation removed per request (server no longer enforces distance)
+
+	-- Per-core limit
+	local maxPerCore = (GameConfig.CORE and GameConfig.CORE.MAX_BUILDINGS_PER_CORE) or 3
+	if coreBuildingCount(core) >= maxPerCore then
+		return false, "CoreLimitReached"
+	end
+
+	-- Category gating per new rules + enemy core empty rule
+	local tid = getPlayerTeamId(player)
+	if not tid then return false, "NoTeam" end
+	local categoryId = getCategoryForBuildingName(buildingName)
+	ensureTeamTables()
+	local available = computeAvailableCategoriesForTeamOnCore(tid, core)
+	if not (available and available[categoryId]) then
+		return false, "LockedCategory"
+	end
+	if core.ownerTeam and core.ownerTeam ~= tid then
+		return false, "EnemyCore"
+	end
+
+	-- Bits / cost
+	local costKey = getCostKeyForPrefab(buildingName)
+	-- Variant overrides (shared model different backend type)
+	if buildingName:find("Barracks") then
+		if variant == "Rocket" then costKey = "Barracks_RocketPack" else costKey = "Barracks_NormalPack" end
+	elseif buildingName:find("Support_Air") then
+		-- CIS: Supertank|AAT|HomingSpider|Hailfire ; REP: ATST|LaserTank|ATTE
+		if variant == "Supertank" then costKey = "Supertank"
+		elseif variant == "AAT" then costKey = "AAT"
+		elseif variant == "HomingSpider" then costKey = "HomingSpider"
+		elseif variant == "Hailfire" or variant == "HailFire" then costKey = "Hailfire"
+		elseif variant == "ATST" or variant == "AT-ST" then costKey = "ATST"
+		elseif variant == "LaserTank" then costKey = "LaserTank"
+		elseif variant == "ATTE" or variant == "AT-TE" then costKey = "ATTE" end
+	end
+	local cost = (GameConfig.COSTS and costKey) and (GameConfig.COSTS[costKey] or 0) or 0
+	if cost <= 0 then cost = 1000 end -- fallback minimal cost
+	if not PlayerManager.HasBits(player, cost) then return false, "InsufficientBits" end
+
+	-- Resolve prefab across both side folders to support cross-side builds
+	local prefab = resolvePrefabModel(buildingName)
+	if not (prefab and prefab:IsA("Model")) then return false, "MissingPrefab" end
+
+	-- Per-type build limit (team-wide)
+	local typeKey = getTypeKeyForName(buildingName)
+	if buildingName:find("Barracks") then
+		typeKey = (variant == "Rocket") and "Barracks_RocketPack" or "Barracks_NormalPack"
+	elseif buildingName:find("Support_Air") then
+		typeKey = costKey -- use vehicle key
+	end
+	local tidCheck = getPlayerTeamId(player)
+	if tidCheck then
+		ensureTeamTables()
+		teamTypeCounts[tidCheck] = teamTypeCounts[tidCheck] or {}
+		local limit = getBuildLimitForType(typeKey)
+		if limit and ((teamTypeCounts[tidCheck][typeKey] or 0) >= limit) then
+			return false, "LimitReached"
+		end
+	end
+
+	-- Spend and place
+	if not PlayerManager.ModifyBits(player, -cost, "Build:" .. buildingName) then
+		return false, "BitsUpdateFailed"
+	end
+	local ok, reason = self:PlaceBuilding(buildingName, coreId, plotLetter)
+	if not ok then
+		-- refund on failure
+		PlayerManager.ModifyBits(player, cost, "RefundBuildFailed")
+		return false, reason or "PlaceFailed"
+	end
+	-- Ensure building OwnerTeam reflects the builder's team (not the core side)
+	local plotAfter = core.plots[plotLetter]
+	if plotAfter and plotAfter.buildingRef then
+		local builderTid = getPlayerTeamId(player)
+		if builderTid then plotAfter.buildingRef:SetAttribute("OwnerTeam", builderTid) end
+		plotAfter.buildingRef:SetAttribute("TypeKey", typeKey)
+		if variant then plotAfter.buildingRef:SetAttribute("Variant", variant) end
+		if builderTid then
+			teamTypeCounts[builderTid][typeKey] = (teamTypeCounts[builderTid][typeKey] or 0) + 1
+			local catIdPlaced = getCategoryForBuildingName(buildingName)
+			-- CommandCenter does not count toward unlocking progression
+			if not string.find(buildingName, "CommandCenter") then
+				teamCategoryCounts[builderTid][catIdPlaced] = (teamCategoryCounts[builderTid][catIdPlaced] or 0) + 1
+			end
+		end
+		-- Mark plot Occupied attribute
+		if plotAfter.part then plotAfter.part:SetAttribute("Occupied", true) end
+	end
+	-- Recompute ownership and update visuals
+	recomputeCoreOwnership(core)
+	updateCoreVisuals(core)
+	applyUsablePlotsVisibility(core)
+
+	-- Spawn Pusher to unstick players
+	local misc = ServerStorage:FindFirstChild("MiscPrefabs")
+	local pusher = misc and misc:FindFirstChild("Pusher")
+	if plotAfter and plotAfter.buildingRef then
+		local baseCf = plotAfter.buildingRef:GetPivot()
+		local extents = plotAfter.buildingRef:GetExtentsSize()
+		local startOffsetY = -math.max(12, extents.Y)
+		local endOffsetY = math.max(18, extents.Y)
+		local pusherClone
+		if pusher and pusher:IsA("Model") then
+			pusherClone = pusher:Clone()
+		else
+			-- Fallback: create a simple box pusher
+			local box = Instance.new("Part")
+			box.Name = "PusherBox"
+			box.Size = Vector3.new(math.max(8, extents.X), math.max(6, math.min(12, extents.Y)), math.max(8, extents.Z))
+			box.Color = Color3.fromRGB(255, 255, 255)
+			box.Material = Enum.Material.SmoothPlastic
+			box.Anchored = true
+			box.CanCollide = true
+			box.Transparency = 1
+			pusherClone = Instance.new("Model")
+			pusherClone.Name = "BuildPusher"
+			box.Parent = pusherClone
+			pusherClone.PrimaryPart = box
+		end
+		if pusherClone then
+			pusherClone.Name = "BuildPusher"
+			for _, d in ipairs(pusherClone:GetDescendants()) do
+				if d:IsA("BasePart") then d.Transparency = 1; d.CanCollide = true; d.Anchored = true end
+			end
+			pusherClone:PivotTo(baseCf * CFrame.new(0, startOffsetY, 0))
+			pusherClone.Parent = Workspace
+			local targetCF = baseCf * CFrame.new(0, endOffsetY, 0)
+			local tweenPart = pusherClone.PrimaryPart or pusherClone:FindFirstChildWhichIsA("BasePart")
+			if tweenPart then
+				local tw = TweenService:Create(tweenPart, TweenInfo.new(0.85, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { CFrame = targetCF })
+				tw:Play()
+			end
+			game:GetService("Debris"):AddItem(pusherClone, 1)
+		end
+	end
+	-- Unlock chain is computed dynamically; no persistent unlock-on-build step per new rules
+	-- play confirm sound to client
+	local sFolder = ReplicatedStorage:FindFirstChild("Sounds")
+	local s = sFolder and sFolder:FindFirstChild("BuildConfirm")
+	if s and s:IsA("Sound") then
+		local clone = s:Clone()
+		clone.Parent = player.Character or workspace
+		clone:Play()
+		game:GetService("Debris"):AddItem(clone, 5)
+	end
+	return true
+end
+
+function BuildManager:PlaceBuilding(prefabName: string, coreId: string, plotLetter: string)
+	local core = coreIdToCore[coreId]
+	if not core then return false, "InvalidCore" end
+	local plot = core.plots[plotLetter]
+	if not plot then return false, "InvalidPlot" end
+	if plot.occupied then return false, "Occupied" end
+
+	-- Resolve prefab across both sides (supports cross-side building)
+	local prefab = resolvePrefabModel(prefabName)
+	if not prefab or not prefab:IsA("Model") then return false, "MissingPrefab" end
+
+	local clone = prefab:Clone()
+	clone:SetAttribute("OwnerTeam", core.ownerTeam)
+	if not clone.PrimaryPart then
+		-- try set a Base part named Base as PrimaryPart
+		local base = clone:FindFirstChild("Base", true)
+		if base and base:IsA("BasePart") then clone.PrimaryPart = base end
+	end
+	clone:PivotTo(plot.originCFrame)
+	clone.Parent = Workspace
+	plot.occupied = true
+	plot.buildingRef = clone
+	if plot.part then plot.part:SetAttribute("Occupied", true) end
+	-- Health widget: ensure IntValue exists; set from per-building stats
+	local hv = clone:FindFirstChild("Health")
+	local stats = getBuildingStats(clone)
+	local targetMax = (stats and stats.MaxHP) or 1000
+	if not hv then
+		hv = Instance.new("IntValue")
+		hv.Name = "Health"
+		hv.Parent = clone
+	end
+	-- Force to configured health on placement
+	hv.Value = targetMax
+	hv:SetAttribute("Max", targetMax)
+	setupBuilding(core, plot)
+	return true
+end
+
+-- duplicate getPlayerTeamId removed
+
+-- Bind prompt interactions
+task.defer(function()
+	-- Wait a bit for prompts to be created by Init
+	task.wait(1)
+	for coreId, core in pairs(coreIdToCore) do
+		for letter, plot in pairs(core.plots) do
+			local prompt = plot.prompt
+			if prompt then
+				prompt.Triggered:Connect(function(player)
+					if not plot.occupied or not plot.buildingRef then return end
+					local pid = getPlayerTeamId(player)
+					local model = plot.buildingRef
+					local ownerTeam = model:GetAttribute("OwnerTeam")
+					-- Fallback to core owner if attribute missing (legacy)
+					ownerTeam = ownerTeam or core.ownerTeam
+					if not (pid and ownerTeam and pid == ownerTeam) then return end
+					local hv = model:FindFirstChild("Health")
+					if hv and hv:IsA("IntValue") then hv.Value = 0 else
+						model:Destroy(); plot.occupied=false; plot.buildingRef=nil
+					end
+				end)
+			end
+			local buildPrompt = plot.buildPrompt
+			if buildPrompt then
+				buildPrompt.Triggered:Connect(function(player)
+					local tidCheck = getPlayerTeamId(player)
+					if core.ownerTeam and (not (tidCheck and tidCheck == core.ownerTeam)) then
+						return -- cannot open build UI on enemy cores; neutral allowed
+					end
+					local rep = game:GetService("ReplicatedStorage")
+					local rem = rep:FindFirstChild("Remotes")
+					local ev = rem and rem:FindFirstChild("RE_Build_RequestOpen")
+					local cats = BuildManager:GetAvailableCategoriesForPlayer(player, core.id)
+					local tid = getPlayerTeamId(player)
+					local buildings = gatherBuildingsForTeam(tid)
+					-- build typeCounts, typeLimits, costs and name->typeKey map
+					local typeCounts = {}
+					local typeLimits = {}
+					local costs = {}
+					local nameToType = {}
+					local nameToBuilt = {}
+					local nameToLimit = {}
+					if tid then
+						ensureTeamTables()
+						for k,v in pairs(teamTypeCounts[tid] or {}) do typeCounts[k] = v end
+					end
+					if GameConfig.BUILD_LIMITS then
+						for k,v in pairs(GameConfig.BUILD_LIMITS) do typeLimits[k] = v end
+					end
+
+					local function costFor(name)
+						local ck = getCostKeyForPrefab(name)
+						local v = (ck and GameConfig.COSTS and GameConfig.COSTS[ck]) or (GameConfig.COSTS and GameConfig.COSTS[name]) or nil
+						if not v or v <= 0 then v = math.max(1000, (GameConfig.COSTS and GameConfig.COSTS.BitWell) or 1000) end
+						return v
+					end
+
+					for catIdx, list in ipairs(buildings) do
+						for _, nm in ipairs(list) do
+							local tkey = getTypeKeyForName(nm)
+							nameToType[nm] = tkey
+							costs[nm] = costFor(nm)
+							nameToBuilt[nm] = (tkey and typeCounts[tkey]) or 0
+							nameToLimit[nm] = (tkey and typeLimits[tkey]) or nil
+						end
+					end
+
+					if ev then ev:FireClient(player, {
+						coreId = core.id,
+						plotLetter = letter,
+						categories = cats,
+						buildings = buildings,
+						typeCounts = typeCounts,
+						typeLimits = typeLimits,
+						costs = costs,
+						nameToType = nameToType,
+						nameToBuilt = nameToBuilt,
+						nameToLimit = nameToLimit,
+						currency = "Bits"
+						}) end
+				end)
+			end
+		end
+	end
+end)
+
+-- Provide a lightweight snapshot for minimap (cores, plots)
+function BuildManager:GetMinimapSnapshot()
+  local list = {}
+  for coreId, core in pairs(coreIdToCore) do
+    local entry = {
+      id = coreId,
+      ownerTeam = core.ownerTeam,
+      position = core.centerCFrame and core.centerCFrame.Position or Vector3.new(),
+      plots = {},
+    }
+    for letter, plot in pairs(core.plots) do
+      local pos = plot.part and plot.part.Position or (plot.originCFrame and plot.originCFrame.Position) or Vector3.new()
+      table.insert(entry.plots, {
+        letter = letter,
+        occupied = plot.occupied and (plot.buildingRef and plot.buildingRef.Parent ~= nil) or false,
+        position = pos,
+      })
+    end
+    table.insert(list, entry)
+  end
+  return list
+end
+
+return BuildManager
+
+
+
+

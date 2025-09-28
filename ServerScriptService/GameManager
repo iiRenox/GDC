@@ -1,0 +1,142 @@
+
+-- GameManager in ServerScriptService
+-- Erstellt Teams, weist Spieler zu und managt Charaktere (KORRIGIERT)
+
+local Players = game:GetService("Players")
+local Teams = game:GetService("Teams")
+local ServerStorage = game:GetService("ServerStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+Players.CharacterAutoLoads = false
+
+local GameConfig = require(ReplicatedStorage.GameConfig)
+local PlayerManager = require(ServerScriptService.Services.PlayerManager)
+local SpeederManager = require(ServerScriptService.Services.SpeederManager)
+local BuildManager = require(ServerScriptService.Services:WaitForChild("BuildManager"))
+local WinService = require(ServerScriptService.Services:WaitForChild("WinService"))
+local MinimapService = require(ServerScriptService.Services:WaitForChild("MinimapService"))
+local okRM, ResourceManager = pcall(require, ServerScriptService.Services:WaitForChild("ResourceManager"))
+
+-- [Team-Erstellung bleibt unverändert]
+print("GameManager: Erstelle Teams...")
+for _, team in ipairs(Teams:GetTeams()) do team:Destroy() end
+for teamId, teamData in pairs(GameConfig.Teams) do
+	local newTeam = Instance.new("Team"); newTeam.Name = teamData.Name; newTeam.TeamColor = BrickColor.new(teamData.Color); newTeam.AutoAssignable = false; newTeam.Parent = Teams
+end
+print("GameManager: Team-Erstellung abgeschlossen.")
+
+PlayerManager.Initialize()
+BuildManager:Init()
+if WinService and WinService.Init then WinService:Init() end
+if MinimapService and MinimapService.Init then MinimapService:Init() end
+if okRM and ResourceManager and ResourceManager.Init then ResourceManager:Init(); ResourceManager:ScatterResources() end
+
+local mapFolder = Workspace:WaitForChild("Ryloth", 15)
+if not mapFolder then error("FATAL: Ryloth Map-Ordner nicht im Workspace gefunden!") end
+-- Use lowercase 'spawns' to match usages below; include both teams
+local spawns = {
+	[1] = mapFolder:WaitForChild(GameConfig.Teams[1].SpawnPointTag, 5),
+	[2] = mapFolder:WaitForChild(GameConfig.Teams[2].SpawnPointTag, 5),
+}
+
+local isReplacingCharacter = {}
+local characterDiedConnections = {}
+
+local function respawnPlayerCharacter(player)
+	if isReplacingCharacter[player] then return end
+	isReplacingCharacter[player] = true
+
+	local teamId = PlayerManager.GetTeamId(player)
+	if not teamId then
+		warn("Kann Spieler nicht spawnen, keine TeamID:", player.Name); isReplacingCharacter[player] = nil; return
+	end
+
+	local teamConfig = GameConfig.Teams[teamId]
+	local newCharacterModelName = teamConfig.CharacterModelName
+	local spawnLocation = spawns[teamId]
+	local characterPrefab = ServerStorage.UnitPrefabs:FindFirstChild(newCharacterModelName) -- Wieder zu ServerStorage geändert
+
+	if not spawnLocation or not characterPrefab then
+		warn("Fehler bei Spawn-Setup für", player.Name); isReplacingCharacter[player] = nil; return
+	end
+
+	if player.Character then player.Character:Destroy() end
+	task.wait()
+
+	local newCharacter = characterPrefab:Clone()
+	newCharacter.Name = player.Name
+	local humanoid = newCharacter:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		if not humanoid:FindFirstChildOfClass("Animator") then Instance.new("Animator", humanoid) end
+		if characterDiedConnections[player] then characterDiedConnections[player]:Disconnect() end
+		characterDiedConnections[player] = humanoid.Died:Connect(function()
+			print(player.Name, "ist gestorben. Starte Respawn-Timer...")
+			task.wait(GameConfig.RESPAWN_TIME)
+			player:LoadCharacter()
+		end)
+	else
+		warn("Neuer Charakter hat keinen Humanoid!", newCharacter.Name)
+	end
+
+	player.Character = newCharacter
+	newCharacter:PivotTo(spawnLocation.CFrame + Vector3.new(0, 5, 0))
+	newCharacter.Parent = Workspace
+	print(player.Name, "gespawnt als", newCharacterModelName)
+
+	task.wait(1)
+	SpeederManager:SpawnSpeederForPlayer(player, teamId)
+
+	task.wait(0.5)
+	isReplacingCharacter[player] = nil
+end
+
+local function onPlayerAdded(player)
+    print(player.Name, "ist dem Spiel beigetreten.")
+
+    -- Ensure teams exist
+    local cisTeam = Teams:FindFirstChild(GameConfig.Teams[1].Name)
+    local repTeam = Teams:FindFirstChild(GameConfig.Teams[2].Name)
+    if not cisTeam or not repTeam then
+        warn("Teams not initialized yet; retrying shortly...")
+        task.delay(0.5, function()
+            if player and player.Parent then onPlayerAdded(player) end
+        end)
+        return
+    end
+
+    -- Assign to team with fewer players (fallback from strict 0/0 check)
+    local cisCount = #cisTeam:GetPlayers()
+    local repCount = #repTeam:GetPlayers()
+    local teamId
+    if cisCount <= repCount then teamId = 1; player.Team = cisTeam else teamId = 2; player.Team = repTeam end
+
+    PlayerManager.AddPlayer(player, teamId)
+
+	player.CharacterAdded:Connect(function(character)
+		print("CharacterAdded Event für", player.Name, "ausgelöst.")
+		respawnPlayerCharacter(player)
+	end)
+
+	print("Fordere initialen Charakter-Spawn für", player.Name, "an...")
+	player:LoadCharacter()
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	print(player.Name, "hat das Spiel verlassen.")
+	if characterDiedConnections[player] then
+		characterDiedConnections[player]:Disconnect(); characterDiedConnections[player] = nil
+	end
+	PlayerManager.RemovePlayer(player)
+end)
+
+-- Serverstart
+for _, player in ipairs(Players:GetPlayers()) do
+	onPlayerAdded(player)
+end
+Players.PlayerAdded:Connect(onPlayerAdded)
+
+-- *** DIESE ZEILE WIRD ENTFERNT ***
+-- SpeederManager:StartUpdateLoop() -- ALT UND FEHLERHAFT
+
+print("GameManager und alle Services sind jetzt aktiv.")

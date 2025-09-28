@@ -1,0 +1,70 @@
+-- File: ServerScriptService/Services/MinimapService
+-- Periodically broadcasts a snapshot of cores, plots, players, and vehicles for the minimap
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local BuildManager = require(ServerScriptService.Services:WaitForChild("BuildManager"))
+local SpeederManager = require(ServerScriptService.Services:WaitForChild("SpeederManager"))
+
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder", ReplicatedStorage)
+Remotes.Name = "Remotes"
+local RE_Minimap_Snapshot = Remotes:FindFirstChild("RE_Minimap_Snapshot") or Instance.new("RemoteEvent", Remotes)
+RE_Minimap_Snapshot.Name = "RE_Minimap_Snapshot"
+
+local MinimapService = {}
+
+local function getPlayersSnapshot()
+	local arr = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			table.insert(arr, {
+				userId = plr.UserId,
+				name = plr.Name,
+				teamName = plr.Team and plr.Team.Name or nil,
+				p = hrp.Position,
+			})
+		end
+	end
+	return arr
+end
+
+local function getSpeedersSnapshot()
+	local arr = {}
+	local list = nil
+	if SpeederManager and SpeederManager.GetActiveSpeedersList then
+		list = SpeederManager:GetActiveSpeedersList()
+	end
+	if list then
+		for _, m in ipairs(list) do
+			if m and m.PrimaryPart then
+				table.insert(arr, {
+					name = m.Name,
+					p = m.PrimaryPart.Position,
+				})
+			end
+		end
+	end
+	return arr
+end
+
+function MinimapService:Init()
+	local acc = 0
+	RunService.Heartbeat:Connect(function(dt)
+		acc += dt
+		if acc < 0.5 then return end
+		acc = 0
+		local payload = {
+			cores = BuildManager.GetMinimapSnapshot and BuildManager:GetMinimapSnapshot() or {},
+			players = getPlayersSnapshot(),
+			vehicles = { speeders = getSpeedersSnapshot() },
+		}
+		RE_Minimap_Snapshot:FireAllClients(payload)
+	end)
+end
+
+return MinimapService

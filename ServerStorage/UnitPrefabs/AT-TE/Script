@@ -1,0 +1,228 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+-- Warte kurz, falls das Modul noch nicht repliziert ist (besonders bei Spielstart)
+local ProceduralModule = require(ReplicatedStorage:WaitForChild("ProceduralModule"))
+
+local ATTE = script.Parent
+local root = ATTE:FindFirstChild("HumanoidRootPart")
+local hum = ATTE:FindFirstChild("Humanoid")
+local alignOrientation = root:FindFirstChild("AlignOrientation")
+
+local target = Workspace:FindFirstChild("Target") -- Stelle sicher, dass "Target" existiert
+
+-- Überprüfe, ob wichtige Teile vorhanden sind
+if not root or not hum or not alignOrientation or not target then
+	warn("ATTE Script: Ein oder mehrere notwendige Objekte fehlen (HumanoidRootPart, Humanoid, AlignOrientation, Target). Script wird gestoppt.")
+	return -- Script beenden, wenn etwas Wichtiges fehlt
+end
+
+--// IkTargets
+local ikTargetsFolder = ATTE:FindFirstChild("IkTargets")
+if not ikTargetsFolder then warn("IkTargets Ordner fehlt!") return end
+
+local leftMiddle_IkTarget = ikTargetsFolder:FindFirstChild("LeftMiddle_IkTarget")
+local leftBack_IkTarget = ikTargetsFolder:FindFirstChild("LeftBack_IkTarget")
+local rightFront_IkTarget = ikTargetsFolder:FindFirstChild("RightFront_IkTarget")
+local rightMiddle_IkTarget = ikTargetsFolder:FindFirstChild("RightMiddle_IkTarget")
+local rightBack_IkTarget = ikTargetsFolder:FindFirstChild("RightBack_IkTarget")
+local leftFront_IkTarget = ikTargetsFolder:FindFirstChild("LeftFront_IkTarget")
+
+--// Raycast parts
+local raycastPartsFolder = ATTE:FindFirstChild("RaycastParts")
+if not raycastPartsFolder then warn("RaycastParts Ordner fehlt!") return end
+
+local leftMiddle_RaycastPart = raycastPartsFolder:FindFirstChild("LeftMiddle_RaycastPart")
+local leftBack_RaycastPart = raycastPartsFolder:FindFirstChild("LeftBack_RaycastPart")
+local rightFront_RaycastPart = raycastPartsFolder:FindFirstChild("RightFront_RaycastPart")
+local rightMiddle_RaycastPart = raycastPartsFolder:FindFirstChild("RightMiddle_RaycastPart")
+local rightBack_RaycastPart = raycastPartsFolder:FindFirstChild("RightBack_RaycastPart")
+local leftFront_RaycastPart = raycastPartsFolder:FindFirstChild("LeftFront_RaycastPart")
+
+--// IKControls & Poles
+local leftFront_IKControl = hum:FindFirstChild("LeftFront_IKControl")
+local leftMiddle_IKControl = hum:FindFirstChild("LeftMiddle_IKControl")
+local leftBack_IKControl = hum:FindFirstChild("LeftBack_IKControl")
+local rightFront_IKControl = hum:FindFirstChild("RightFront_IKControl")
+local rightMiddle_IKControl = hum:FindFirstChild("RightMiddle_IKControl")
+local rightBack_IKControl = hum:FindFirstChild("RightBack_IKControl")
+
+local leftFront_Pole = root:FindFirstChild("LeftFront_Pole")
+local leftMiddle_Pole = root:FindFirstChild("LeftMiddle_Pole")
+local leftBack_Pole = root:FindFirstChild("LeftBack_Pole")
+local rightFront_Pole = root:FindFirstChild("RightFront_Pole")
+local rightMiddle_Pole = root:FindFirstChild("RightMiddle_Pole")
+local rightBack_Pole = root:FindFirstChild("RightBack_Pole")
+
+-- ===============================================================
+-- DETAILLIERTE ÜBERPRÜFUNG ALLER NOTWENDIGEN TEILE
+-- ===============================================================
+local allPartsFound = true -- Start with the assumption that everything exists
+
+-- 1. Grundlegende Objekte prüfen
+if not root then warn("FEHLER: 'HumanoidRootPart' nicht in", ATTE:GetFullName(), "gefunden!"); allPartsFound = false end
+if not hum then warn("FEHLER: 'Humanoid' nicht in", ATTE:GetFullName(), "gefunden!"); allPartsFound = false end
+if not alignOrientation then warn("FEHLER: 'AlignOrientation' nicht in 'HumanoidRootPart' gefunden!"); allPartsFound = false end
+if not target then warn("FEHLER: 'Target' nicht im Workspace gefunden!"); allPartsFound = false end -- target ist im Workspace
+
+-- 2. Ordner prüfen
+if not ikTargetsFolder then warn("FEHLER: Ordner 'IkTargets' nicht in", ATTE:GetFullName(), "gefunden!"); allPartsFound = false end
+if not raycastPartsFolder then warn("FEHLER: Ordner 'RaycastParts' nicht in", ATTE:GetFullName(), "gefunden!"); allPartsFound = false end
+
+-- 3. IK Targets prüfen (nur wenn Ordner existiert)
+if ikTargetsFolder then
+	if not leftFront_IkTarget then warn("FEHLER: IK Target 'LeftFront_IkTarget' nicht in 'IkTargets' gefunden!") allPartsFound = false end
+	if not leftMiddle_IkTarget then warn("FEHLER: IK Target 'LeftMiddle_IkTarget' nicht in 'IkTargets' gefunden!") allPartsFound = false end
+	if not leftBack_IkTarget then warn("FEHLER: IK Target 'LeftBack_IkTarget' nicht in 'IkTargets' gefunden!") allPartsFound = false end
+	if not rightFront_IkTarget then warn("FEHLER: IK Target 'RightFront_IkTarget' nicht in 'IkTargets' gefunden!") allPartsFound = false end
+	if not rightMiddle_IkTarget then warn("FEHLER: IK Target 'RightMiddle_IkTarget' nicht in 'IkTargets' gefunden!") allPartsFound = false end
+	if not rightBack_IkTarget then warn("FEHLER: IK Target 'RightBack_IkTarget' nicht in 'IkTargets' gefunden!") allPartsFound = false end
+else
+	warn("INFO: IK Targets können nicht geprüft werden, da der Ordner 'IkTargets' fehlt.")
+end
+
+-- 4. Raycast Parts prüfen (nur wenn Ordner existiert)
+if raycastPartsFolder then
+	if not leftFront_RaycastPart then warn("FEHLER: Raycast Part 'LeftFront_RaycastPart' nicht in 'RaycastParts' gefunden!") allPartsFound = false end
+	if not leftMiddle_RaycastPart then warn("FEHLER: Raycast Part 'LeftMiddle_RaycastPart' nicht in 'RaycastParts' gefunden!") allPartsFound = false end
+	if not leftBack_RaycastPart then warn("FEHLER: Raycast Part 'LeftBack_RaycastPart' nicht in 'RaycastParts' gefunden!") allPartsFound = false end
+	if not rightFront_RaycastPart then warn("FEHLER: Raycast Part 'RightFront_RaycastPart' nicht in 'RaycastParts' gefunden!") allPartsFound = false end
+	if not rightMiddle_RaycastPart then warn("FEHLER: Raycast Part 'RightMiddle_RaycastPart' nicht in 'RaycastParts' gefunden!") allPartsFound = false end
+	if not rightBack_RaycastPart then warn("FEHLER: Raycast Part 'RightBack_RaycastPart' nicht in 'RaycastParts' gefunden!") allPartsFound = false end
+else
+	warn("INFO: Raycast Parts können nicht geprüft werden, da der Ordner 'RaycastParts' fehlt.")
+end
+
+-- 5. IK Controls prüfen (im Humanoid)
+if hum then
+	if not leftFront_IKControl then warn("FEHLER: IK Control 'LeftFront_IKControl' nicht im Humanoid gefunden!") allPartsFound = false end
+	if not leftMiddle_IKControl then warn("FEHLER: IK Control 'LeftMiddle_IKControl' nicht im Humanoid gefunden!") allPartsFound = false end
+	if not leftBack_IKControl then warn("FEHLER: IK Control 'LeftBack_IKControl' nicht im Humanoid gefunden!") allPartsFound = false end
+	if not rightFront_IKControl then warn("FEHLER: IK Control 'RightFront_IKControl' nicht im Humanoid gefunden!") allPartsFound = false end
+	if not rightMiddle_IKControl then warn("FEHLER: IK Control 'RightMiddle_IKControl' nicht im Humanoid gefunden!") allPartsFound = false end
+	if not rightBack_IKControl then warn("FEHLER: IK Control 'RightBack_IKControl' nicht im Humanoid gefunden!") allPartsFound = false end
+else
+	warn("INFO: IK Controls können nicht geprüft werden, da der Humanoid fehlt.")
+end
+
+-- 6. Poles prüfen (im HumanoidRootPart)
+if root then
+	if not leftFront_Pole then warn("FEHLER: Pole 'LeftFront_Pole' nicht im HumanoidRootPart gefunden!") allPartsFound = false end
+	if not leftMiddle_Pole then warn("FEHLER: Pole 'LeftMiddle_Pole' nicht im HumanoidRootPart gefunden!") allPartsFound = false end
+	if not leftBack_Pole then warn("FEHLER: Pole 'LeftBack_Pole' nicht im HumanoidRootPart gefunden!") allPartsFound = false end
+	if not rightFront_Pole then warn("FEHLER: Pole 'RightFront_Pole' nicht im HumanoidRootPart gefunden!") allPartsFound = false end
+	if not rightMiddle_Pole then warn("FEHLER: Pole 'RightMiddle_Pole' nicht im HumanoidRootPart gefunden!") allPartsFound = false end
+	if not rightBack_Pole then warn("FEHLER: Pole 'RightBack_Pole' nicht im HumanoidRootPart gefunden!") allPartsFound = false end
+else
+	warn("INFO: Poles können nicht geprüft werden, da der HumanoidRootPart fehlt.")
+end
+
+
+-- Stoppe das Skript, wenn etwas fehlt
+if not allPartsFound then
+	warn("--------------------------------------------------------------------------")
+	warn("ATTE Script: Mindestens ein benötigtes Teil fehlt oder wurde nicht gefunden.")
+	warn("Bitte überprüfe die FEHLER-Meldungen oben und stelle sicher, dass alle Teile")
+	warn("korrekt benannt sind und sich an der erwarteten Stelle befinden (z.B. Poles")
+	warn("im HumanoidRootPart, IK Controls im Humanoid, etc.).")
+	warn("Das Skript wird beendet.")
+	warn("--------------------------------------------------------------------------")
+	return -- Beende das Skript hier
+end
+
+-- Wenn wir hier ankommen, wurden alle Teile gefunden.
+print("ATTE Script: Alle benötigten Teile wurden erfolgreich gefunden.")
+
+-- ===============================================================
+-- ENDE DER DETAILLIERTEN ÜBERPRÜFUNG
+-- ===============================================================
+
+-- Der Rest deines Skripts (Pole zuweisen, Transparenz setzen, etc.) folgt hier...
+-- // Pole zuweisen (jetzt sicher, da alles existiert)
+leftFront_IKControl.Pole = leftFront_Pole
+-- ... (Rest der Zuweisungen) ...
+rightBack_IKControl.Pole = rightBack_Pole
+
+-- // RaycastParams ...
+
+-- Pole zuweisen
+leftFront_IKControl.Pole = leftFront_Pole
+leftMiddle_IKControl.Pole = leftMiddle_Pole
+leftBack_IKControl.Pole = leftBack_Pole
+rightFront_IKControl.Pole = rightFront_Pole
+rightMiddle_IKControl.Pole = rightMiddle_Pole
+rightBack_IKControl.Pole = rightBack_Pole
+
+--// RaycastParams
+local rayCastParams = RaycastParams.new()
+rayCastParams.FilterDescendantsInstances = {ATTE}
+rayCastParams.FilterType = Enum.RaycastFilterType.Exclude
+rayCastParams.IgnoreWater = true -- Optional: Wasser ignorieren?
+
+-- Setze Transparenz für Debugging
+for _, v: BasePart in ikTargetsFolder:GetChildren() do
+	if v:IsA("BasePart") then v.Transparency = 0 end
+end
+
+for _, v: BasePart in raycastPartsFolder:GetChildren() do
+	if v:IsA("BasePart") then v.Transparency = 0 end
+end
+
+-- Bewegung zum Ziel starten
+coroutine.wrap(function()
+	while hum and hum.Parent do -- Sicherstellen, dass der Humanoid noch existiert
+		hum:MoveTo(target.Position)
+		task.wait(0.25)
+	end
+end)()
+
+hum.HipHeight = 12.5
+hum.WalkSpeed = 7
+
+-- Körperausrichtung an Boden und Ziel anpassen
+RunService.Heartbeat:Connect(function(deltaTime)
+	-- Raycast vom Körperzentrum nach unten
+	local bodyRayCast = Workspace:Raycast(root.Position, root.CFrame.UpVector * -1000, rayCastParams)
+
+	if bodyRayCast then
+		-- Berechne Rotation, um den Körper an die Bodenneigung anzupassen
+		local rotateToFloorCFrame = ProceduralModule:getRotationBetween(root.CFrame.UpVector, bodyRayCast.Normal)
+		local targetLookAt = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z) -- Nur horizontal ausrichten
+		local lookAtCFrame = CFrame.lookAt(root.Position, targetLookAt)
+
+		-- Kombiniere Bodenneigung und Ausrichtung zum Ziel
+		-- Wende zuerst die Bodenneigung an, dann die horizontale Ausrichtung
+		alignOrientation.CFrame = rotateToFloorCFrame * lookAtCFrame.Rotation
+
+		-- Alternative Berechnung für horizontalAngle (manchmal stabiler als LookAt)
+		-- local targetDirection = (target.Position - root.Position)
+		-- local horizontalDirection = Vector3.new(targetDirection.X, 0, targetDirection.Z).Unit
+		-- local horizontalAngle = math.atan2(horizontalDirection.X, horizontalDirection.Z) -- Beachte Reihentolge X, Z für atan2
+		-- alignOrientation.CFrame = rotateToFloorCFrame * CFrame.Angles(0, horizontalAngle, 0)
+
+	else
+		-- Wenn kein Boden gefunden wird, richte nur horizontal aus
+		local targetLookAt = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
+		local lookAtCFrame = CFrame.lookAt(root.Position, targetLookAt)
+		alignOrientation.CFrame = lookAtCFrame.Rotation
+	end
+end)
+
+
+-- Beinschritt-Schleife
+while ATTE.Parent and hum and hum.Health > 0 do
+	-- Gruppe 1 (Annahme: Rechte hintere Bein ist hier)
+	ProceduralModule:IkLegStep(leftFront_IkTarget, leftFront_RaycastPart, root, 5, 3, 6, 0.05, rayCastParams) -- Normal: 0.05
+	ProceduralModule:IkLegStep(leftMiddle_IkTarget, leftMiddle_RaycastPart, root, 7, 4, 4, 0.05, rayCastParams) -- Normal: 0.05
+	ProceduralModule:IkLegStep(rightBack_IkTarget, rightBack_RaycastPart, root, 3, 3, 4, 0.03, rayCastParams) -- Schneller: 0.03
+	task.wait(0.1) -- Behalte die Pause zwischen den Gruppen bei
+
+	-- Gruppe 2 (Annahme: Linke hintere Bein ist hier)
+	ProceduralModule:IkLegStep(rightFront_IkTarget, rightFront_RaycastPart, root, 5, 3, 6, 0.05, rayCastParams) -- Normal: 0.05
+	ProceduralModule:IkLegStep(rightMiddle_IkTarget, rightMiddle_RaycastPart, root, 7, 4, 4, 0.05, rayCastParams) -- Normoral: 0.05
+	ProceduralModule:IkLegStep(leftBack_IkTarget, leftBack_RaycastPart, root, 3, 3, 4, 0.03, rayCastParams)  -- Schneller: 0.03
+	task.wait(0.1) -- Behalte die Pause zwischen den Gruppen bei
+end
+
+print("ATTE Script beendet.")

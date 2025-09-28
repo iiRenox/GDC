@@ -1,0 +1,178 @@
+-- File: ServerScriptService/RemoteHandler
+-- Modified/Created by: GPT-5 (Cursor) — 2025-08-08
+-- Based on: Gemini scripts — RemoteHandler
+-- Summary: Centralized, validated router with rate-limiting; binds canonical remotes per §6.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Players = game:GetService("Players")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+
+-- Validate Remotes root and canonical events
+local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes", 15)
+if not RemotesFolder then warn("[RemoteHandler][WARN] Remotes folder missing"); return end
+
+local RE = {
+    UpdateInput = RemotesFolder:FindFirstChild("RE_Speeder_UpdateInput"),
+    Fire = RemotesFolder:FindFirstChild("RE_Speeder_Fire"),
+    BuildOpen = RemotesFolder:FindFirstChild("RE_Build_RequestOpen"),
+    BuildBuy = RemotesFolder:FindFirstChild("RE_Build_RequestPurchase"),
+    CallTroops = RemotesFolder:FindFirstChild("RE_CallTroops"),
+    TorpedoPickup = RemotesFolder:FindFirstChild("RE_Torpedo_PickupRequest"),
+    TorpedoFire = RemotesFolder:FindFirstChild("RE_Torpedo_Fire"),
+    RequestUnitControl = RemotesFolder:FindFirstChild("RE_RequestUnitControl"),
+    PlayEffect = RemotesFolder:FindFirstChild("RE_PlayEffect"),
+}
+local RF = {
+    GetGameConfig = RemotesFolder:FindFirstChild("RF_GetGameConfig"),
+    GetCoreStatus = RemotesFolder:FindFirstChild("RF_GetCoreStatus"),
+}
+
+-- Load services (may be nil in early boot; handlers check for existence)
+local okPM, PlayerManager = pcall(require, ServerScriptService.Services:WaitForChild("PlayerManager"))
+if not okPM then warn("[RemoteHandler] PlayerManager load failed:", PlayerManager) end
+local okSM, SpeederManager = pcall(require, ServerScriptService.Services:WaitForChild("SpeederManager"))
+if not okSM then warn("[RemoteHandler] SpeederManager load failed:", SpeederManager) end
+local okCS, CombatService = pcall(require, ServerScriptService.Services:WaitForChild("CombatService"))
+if not okCS then warn("[RemoteHandler] CombatService load failed:", CombatService) end
+local okBM, BuildManager = pcall(require, ServerScriptService.Services:WaitForChild("BuildManager"))
+if not okBM then BuildManager = nil end
+local okTS, TorpedoService = pcall(require, ServerScriptService.Services:WaitForChild("TorpedoService"))
+if not okTS then TorpedoService = nil end
+
+-- Lade hier später weitere Services
+-- local success, BuildingService = pcall(require, ServerScriptService.Services:WaitForChild("BuildingService"))
+-- if not success then warn("RemoteHandler konnte BuildingService nicht laden:", BuildingService) end
+
+print("[RemoteHandler][INFO] Starting router...")
+-- Simple per-player rate limiter
+local lastCallTimes = {}
+local function isRateLimited(player: Player, key: string, hz: number): boolean
+    local now = os.clock()
+    lastCallTimes[player] = lastCallTimes[player] or {}
+    local t = lastCallTimes[player][key] or 0
+    local minInterval = 1 / math.max(hz, 1)
+    if now - t < minInterval then return true end
+    lastCallTimes[player][key] = now
+    return false
+end
+
+-- Validation helpers
+local function validPlayer(p)
+    return p and p:IsA("Player") and p.Parent ~= nil
+end
+
+-- Bind canonical remotes
+if RE.UpdateInput then
+    RE.UpdateInput.OnServerEvent:Connect(function(player, payload)
+        if not validPlayer(player) then return end
+        if isRateLimited(player, "RE_Speeder_UpdateInput", GameConfig.SPEEDER.INPUT_RATE_LIMIT) then return end
+        if SpeederManager and payload then
+            SpeederManager:UpdatePlayerInput(player, payload)
+        end
+    end)
+end
+
+if RE.Fire then
+    RE.Fire.OnServerEvent:Connect(function(player, payload)
+        if not validPlayer(player) then return end
+        if isRateLimited(player, "RE_Speeder_Fire", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return end
+        if SpeederManager and payload then
+            local weaponId = (type(payload) == "table" and payload.weaponId) or "primary"
+            local muzzleCFrame = (type(payload) == "table" and payload.muzzleCFrame) or payload
+            if muzzleCFrame then
+                SpeederManager:HandleFireRequest(player, muzzleCFrame)
+            end
+        end
+    end)
+end
+
+if RE.BuildBuy and BuildManager then
+    RE.BuildBuy.OnServerEvent:Connect(function(player, payload)
+        if not validPlayer(player) then return end
+        if isRateLimited(player, "RE_Build_RequestPurchase", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return end
+        if type(payload) ~= "table" then return end
+        local coreId = payload.coreId
+        local plotLetter = payload.plotLetter or payload.plotIndex -- accept letter only here
+        local buildingName = payload.buildingName
+        local variant = payload.variant
+        if type(coreId) ~= "string" or type(plotLetter) ~= "string" or type(buildingName) ~= "string" then return end
+        local ok, reason = BuildManager:AttemptPurchase(player, coreId, plotLetter, buildingName, variant)
+        if not ok and GameConfig.DEV_MODE then
+            warn(string.format("[RemoteHandler] Build purchase failed p=%s core=%s plot=%s b=%s reason=%s", player.Name, tostring(coreId), tostring(plotLetter), tostring(buildingName), tostring(reason)))
+            local sFolder = ReplicatedStorage:FindFirstChild("Sounds")
+            local s = sFolder and sFolder:FindFirstChild("BuildFail")
+            if s and s:IsA("Sound") then local sc = s:Clone(); sc.Parent = player.Character or workspace; sc:Play(); game:GetService("Debris"):AddItem(sc, 5) end
+        end
+    end)
+end
+
+if RE.TorpedoPickup then
+    RE.TorpedoPickup.OnServerEvent:Connect(function(player, payload)
+        if not validPlayer(player) then return end
+        if isRateLimited(player, "RE_Torpedo_PickupRequest", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return end
+        -- Pickup handled via prompt in TorpedoService; event kept for compatibility
+    end)
+end
+
+if RE.TorpedoFire and TorpedoService then
+    RE.TorpedoFire.OnServerEvent:Connect(function(player)
+        if not validPlayer(player) then return end
+        if isRateLimited(player, "RE_Torpedo_Fire", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return end
+        TorpedoService:Fire(player)
+    end)
+end
+
+if RF.GetGameConfig and RF.GetGameConfig:IsA("RemoteFunction") then
+    RF.GetGameConfig.OnServerInvoke = function(player)
+        if not validPlayer(player) then return nil end
+        -- Sanitize: return only client-safe subset
+        return {
+            STARTING_BITS = GameConfig.STARTING_BITS,
+            UI = GameConfig.UI,
+            COSTS = GameConfig.COSTS,
+            HEARTS = GameConfig.HEARTS,
+            TEAM = GameConfig.TEAM,
+        }
+    end
+elseif RF.GetGameConfig then
+    warn("[RemoteHandler] RF_GetGameConfig exists but is not a RemoteFunction. Please create it as a RemoteFunction (not RemoteEvent).")
+end
+
+if RF.GetCoreStatus and RF.GetCoreStatus:IsA("RemoteFunction") then
+    RF.GetCoreStatus.OnServerInvoke = function(player, input)
+        if not validPlayer(player) then return nil end
+        if isRateLimited(player, "RF_GetCoreStatus", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return nil end
+        if not BuildManager then return nil end
+        if type(input) ~= "table" or type(input.coreId) ~= "string" then return nil end
+        return BuildManager:GetCoreStatus(input.coreId)
+    end
+elseif RF.GetCoreStatus then
+    warn("[RemoteHandler] RF_GetCoreStatus exists but is not a RemoteFunction. Please create it as a RemoteFunction (not RemoteEvent).")
+end
+
+print("[RemoteHandler][INFO] Router ready.")
+
+-- Legacy compatibility: route old generic commands if present
+local legacyEvent = RemotesFolder:FindFirstChild("ClientToServerCommand")
+if legacyEvent then
+    legacyEvent.OnServerEvent:Connect(function(player, command, ...)
+        if not validPlayer(player) then return end
+        local args = { ... }
+        if command == "RequestEnterSpeeder" then
+            local speederModel = args[1]
+            if SpeederManager and speederModel then SpeederManager:HandleEnterRequest(player, speederModel) end
+        elseif command == "UpdateSpeederInput" then
+            local inputTable = args[1]
+            if SpeederManager and inputTable then SpeederManager:UpdatePlayerInput(player, inputTable) end
+        elseif command == "SpeederFire" then
+            local muzzleCFrame = args[1]
+            if SpeederManager and muzzleCFrame then SpeederManager:HandleFireRequest(player, muzzleCFrame) end
+        else
+            if GameConfig.DEV_MODE then warn("[RemoteHandler][LEGACY] Unknown command:", command) end
+	end
+end)
+end
+

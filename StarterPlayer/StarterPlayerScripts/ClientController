@@ -1,0 +1,106 @@
+-- ClientController in StarterPlayer.StarterPlayerScripts
+-- FINALE VERSION MIT POLIERTER CONTROLLER-STEUERUNG & CLIENT-EFFEKTEN
+
+-- // Services
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local Debris = game:GetService("Debris")
+
+-- // Lokale Spieler-Referenz
+local player = Players.LocalPlayer
+print("ClientController (vFINAL w/ ClientFX & InvertedSteer): Gestartet für", player.Name)
+
+-- ===============================================================
+-- 1. SICHERES LADEN VON RESSOURCEN
+-- ===============================================================
+local playerGui = player:WaitForChild("PlayerGui", 20); if not playerGui then warn("ClientController: PlayerGui nicht gefunden!"); return end
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig", 10)); local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+if not (GameConfig and Remotes) then warn("ClientController: GameConfig oder Remotes fehlen!"); return end
+local clientToServerEvent = Remotes:WaitForChild("ClientToServerCommand", 5); local serverToClientUpdate = Remotes:WaitForChild("ServerToClientUpdate", 5); local serverToAllClientsUpdate = Remotes:WaitForChild("ServerToAllClientsUpdate", 5)
+if not (clientToServerEvent and serverToClientUpdate and serverToAllClientsUpdate) then warn("ClientController: Wichtige RemoteEvents fehlen!"); return end
+print("ClientController: Alle Ressourcen erfolgreich geladen.")
+
+-- ===============================================================
+-- 2. CHARAKTER MOVEMENT-LOGIK
+-- ===============================================================
+local FIXED_HIP_HEIGHT = 3.25; local SPRINT_MULTIPLIER = 1.8; local DOUBLE_JUMP_VELOCITY = 40; local lastInitializedCharacter = nil; local humanoid = nil; local rootPart = nil; local animator = nil; local defaultWalkSpeed = 16; local canDoubleJump = false; local hasDoubleJumped = false; local isSprinting = false; local doubleJumpAnimation = Instance.new("Animation"); doubleJumpAnimation.AnimationId = "rbxassetid://18537367238"; local jumpAnimTrack = nil; local stateChangedConnection = nil
+local function handleMovementInput(actionName, inputState, inputObject) if not humanoid or humanoid.Health <= 0 then return Enum.ContextActionResult.Pass end; if inputState == Enum.UserInputState.Begin then if actionName == "Sprint" then humanoid.WalkSpeed = defaultWalkSpeed * SPRINT_MULTIPLIER; isSprinting = true elseif actionName == "Jump" then local state = humanoid:GetState(); if state == Enum.HumanoidStateType.Running or state == Enum.HumanoidStateType.Landed or state == Enum.HumanoidStateType.Climbing then humanoid:ChangeState(Enum.HumanoidStateType.Jumping); canDoubleJump = true; hasDoubleJumped = false else if canDoubleJump and not hasDoubleJumped then hasDoubleJumped = true; rootPart.Velocity = Vector3.new(rootPart.Velocity.X, DOUBLE_JUMP_VELOCITY, rootPart.Velocity.Z); if jumpAnimTrack then jumpAnimTrack:Play() end end end end elseif inputState == Enum.UserInputState.End then if actionName == "Sprint" and isSprinting then humanoid.WalkSpeed = defaultWalkSpeed; isSprinting = false end end; return Enum.ContextActionResult.Pass end
+local function setupCharacter(character) if stateChangedConnection then stateChangedConnection:Disconnect(); stateChangedConnection = nil end; humanoid = character:FindFirstChildOfClass("Humanoid"); rootPart = character:FindFirstChild("HumanoidRootPart"); if not humanoid or not rootPart then return false end; animator = humanoid:FindFirstChildOfClass("Animator"); if not animator then animator = character:FindFirstChildOfClass("Animator"); if not animator then warn("Animator konnte im Charakter nicht gefunden werden.") end end; humanoid.HipHeight = FIXED_HIP_HEIGHT; defaultWalkSpeed = humanoid.WalkSpeed; canDoubleJump = false; hasDoubleJumped = false; isSprinting = false; if animator then if jumpAnimTrack then jumpAnimTrack:Destroy() end; jumpAnimTrack = animator:LoadAnimation(doubleJumpAnimation) end; stateChangedConnection = humanoid.StateChanged:Connect(function(_, newState) if newState == Enum.HumanoidStateType.Landed then canDoubleJump = false; hasDoubleJumped = false; if jumpAnimTrack and jumpAnimTrack.IsPlaying then jumpAnimTrack:Stop() end end end); print("Client: Charakter-Movement erfolgreich initialisiert für", character.Name); lastInitializedCharacter = character; return true end
+ContextActionService:BindAction("Sprint", handleMovementInput, true, Enum.KeyCode.LeftShift, Enum.KeyCode.ButtonB); ContextActionService:BindAction("Jump", handleMovementInput, true, Enum.KeyCode.Space, Enum.KeyCode.ButtonA)
+
+-- ===============================================================
+-- 3. SPEEDER-LOGIK
+-- ===============================================================
+local initializedSpeeders = {}; local currentControlledSpeeder = nil; local CONSTANT_HOVER_HEIGHT = 180; local lastSentInput = {}; local fireRate = 0.2; local nextFire = 0; local lastMuzzle = "Right"
+local function initializeSpeeder(speeder) if initializedSpeeders[speeder] then return end; initializedSpeeders[speeder] = true; print("Client: Initialisiere Speeder", speeder.Name); local vehicleSeat = speeder:WaitForChild("VehicleSeat", 5); if not vehicleSeat then return end; local prompt = vehicleSeat:WaitForChild("ProximityPrompt", 5); if prompt then prompt.Triggered:Connect(function() clientToServerEvent:FireServer("RequestEnterSpeeder", speeder) end) end; vehicleSeat:GetPropertyChangedSignal("Occupant"):Connect(function() if vehicleSeat.Occupant and vehicleSeat.Occupant.Parent == player.Character then currentControlledSpeeder = speeder elseif currentControlledSpeeder == speeder then currentControlledSpeeder = nil; clientToServerEvent:FireServer("UpdateSpeederInput", {Throttle=0, Steer=0, Boosting=false, Firing=false}) end end); speeder.Destroying:Connect(function() initializedSpeeders[speeder] = nil; if currentControlledSpeeder == speeder then currentControlledSpeeder = nil end end) end
+
+-- ===============================================================
+-- 4. HAUPT-UPDATE-SCHLEIFE UND EVENT-VERBINDUNGEN
+-- ===============================================================
+
+serverToAllClientsUpdate.OnClientEvent:Connect(function(command, effectType, pos1)
+	if command == "PlayEffect" then
+		if effectType == "LaserImpact" then
+			local explosion = Instance.new("Explosion")
+			explosion.Position = pos1
+			explosion.BlastRadius = 4
+			explosion.BlastPressure = 0
+			explosion.DestroyJointRadiusPercent = 0
+			explosion.Parent = workspace
+		end
+	end
+end)
+
+-- ... (Restliche Event-Listener und UI-Deaktivierung)
+serverToClientUpdate.OnClientEvent:Connect(function(command, ...) end); local function handleRTSInput(a,b,c)return Enum.ContextActionResult.Pass end; ContextActionService:BindAction("PrimaryAction",handleRTSInput,false,Enum.UserInputType.MouseButton1); ContextActionService:BindAction("SecondaryAction",handleRTSInput,false,Enum.UserInputType.MouseButton2); ContextActionService:BindAction("ArmyFollow",handleRTSInput,false,Enum.KeyCode.G); StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,false);StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList,true);StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Health,false)
+
+RunService.Heartbeat:Connect(function()
+	local character = player.Character; if character and character ~= lastInitializedCharacter then setupCharacter(character) end
+	for _, speeder in ipairs(CollectionService:GetTagged("Speeder")) do if not initializedSpeeders[speeder] then initializeSpeeder(speeder) end end
+
+	if currentControlledSpeeder then
+		local inputTable = {Throttle = 0, Steer = 0, Boosting = false}
+
+		-- Tastatur
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then inputTable.Throttle = 1 elseif UserInputService:IsKeyDown(Enum.KeyCode.S) then inputTable.Throttle = -1 end
+
+		-- INVERTIERTE STEUERUNG
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then inputTable.Steer = -1 
+		elseif UserInputService:IsKeyDown(Enum.KeyCode.D) then inputTable.Steer = 1 end
+
+		inputTable.Boosting = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+
+		-- Controller
+		local gamepadState = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)
+		if gamepadState then
+			-- INVERTIERTE D-PAD STEUERUNG
+			if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.DPadUp) then inputTable.Throttle = 1
+			elseif UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.DPadDown) then inputTable.Throttle = -1 end
+			if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.DPadLeft) then inputTable.Steer = -1
+			elseif UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.DPadRight) then inputTable.Steer = 1 end
+
+			if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonB) then inputTable.Boosting = true end
+		end
+
+		local hasChanged = false; for key, value in pairs(inputTable) do if lastSentInput[key] ~= value then hasChanged = true; break end end
+		if hasChanged then for key, value in pairs(inputTable) do lastSentInput[key] = value end; clientToServerEvent:FireServer("UpdateSpeederInput", inputTable) end
+
+		local isCurrentlyFiring = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) or UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)
+		if isCurrentlyFiring and tick() > nextFire then
+			nextFire = tick() + fireRate
+			local muzzle; if lastMuzzle == "Right" then muzzle = currentControlledSpeeder.WeaponMounts:FindFirstChild("MuzzleLeft"); lastMuzzle = "Left" else muzzle = currentControlledSpeeder.WeaponMounts:FindFirstChild("MuzzleRight"); lastMuzzle = "Right" end
+			if muzzle then
+				clientToServerEvent:FireServer("SpeederFire", muzzle.CFrame)
+				-- Veraltete Laser-Erstellung entfernt
+			end
+		end
+	end
+	-- KEINE PHYSIK-LOGIK MEHR HIER
+end)
+
+print("ClientController Initialisierung abgeschlossen und Haupt-Loop gestartet.")

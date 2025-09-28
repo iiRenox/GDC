@@ -1,0 +1,157 @@
+-- File: ServerScriptService/Services/WinService
+-- Handles win/lose conditions, announcements, freeze, fade, teleport, and faction-empty timeout
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local RunService = game:GetService("RunService")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+local WinService = {}
+
+-- Remotes
+local RemotesFolder = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder", ReplicatedStorage)
+RemotesFolder.Name = "Remotes"
+local RE_Win_Announce = RemotesFolder:FindFirstChild("RE_Win_Announce") or Instance.new("RemoteEvent", RemotesFolder)
+RE_Win_Announce.Name = "RE_Win_Announce"
+local RE_SharedTimerSync = RemotesFolder:FindFirstChild("RE_SharedTimerSync") or Instance.new("RemoteEvent", RemotesFolder)
+RE_SharedTimerSync.Name = "RE_SharedTimerSync"
+
+-- State
+local matchEnded = false
+local hadAtLeastTwoPlayers = false
+local emptyTeamDeadline = nil -- { teamId = number, at = time }
+local sharedTimerStart = nil
+local TELEPORT_PLACE_ID = 97947350878730
+
+local function getTeamIdFromPlayer(plr)
+	if not plr or not plr.Team then return nil end
+	local repName = GameConfig.Teams[2].Name
+	local cisName = GameConfig.Teams[1].Name
+	if plr.Team.Name == repName then return GameConfig.TEAM.REP end
+	if plr.Team.Name == cisName then return GameConfig.TEAM.CIS end
+	return nil
+end
+
+local function countTeams()
+	local counts = { [GameConfig.TEAM.CIS] = 0, [GameConfig.TEAM.REP] = 0 }
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local tid = getTeamIdFromPlayer(plr)
+		if tid then counts[tid] += 1 end
+	end
+	return counts
+end
+
+local function freezeAll()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if char then
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hum then
+				hum.WalkSpeed = 0
+				hum.JumpPower = 0
+				hum.JumpHeight = 0
+				hum.PlatformStand = true
+			end
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then part.AssemblyLinearVelocity = Vector3.new() end
+			end
+		end
+	end
+end
+
+local function teleportAll()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		pcall(function()
+			TeleportService:Teleport(TELEPORT_PLACE_ID, plr)
+		end)
+	end
+end
+
+local function announceWin(winnerTeam, reason)
+	if matchEnded then return end
+	matchEnded = true
+	local payload = { winner = winnerTeam, reason = reason or "CommandCenterDestroyed" }
+	RE_Win_Announce:FireAllClients(payload)
+	freezeAll()
+	task.delay(10, function()
+		teleportAll()
+	end)
+end
+
+function WinService:OnCommandCenterDestroyed(destroyedTeam)
+	if matchEnded then return end
+	local winner = (destroyedTeam == GameConfig.TEAM.REP) and GameConfig.TEAM.CIS or GameConfig.TEAM.REP
+	announceWin(winner, "CommandCenterDestroyed")
+end
+
+local function ensureSharedTimer()
+	if sharedTimerStart then return end
+	sharedTimerStart = os.time()
+	RE_SharedTimerSync:FireAllClients({ startEpoch = sharedTimerStart })
+end
+
+local function onPlayerAdded(plr)
+	ensureSharedTimer()
+	local c = countTeams()
+	if (c[GameConfig.TEAM.CIS] + c[GameConfig.TEAM.REP]) >= 2 then
+		hadAtLeastTwoPlayers = true
+	end
+	-- If the empty-team countdown was running and this player joins that team, cancel it
+	if emptyTeamDeadline then
+		local tid = getTeamIdFromPlayer(plr)
+		if tid and tid == emptyTeamDeadline.teamId then
+			emptyTeamDeadline = nil
+		end
+	end
+	-- Send timer to this late-joining player as well
+	if sharedTimerStart then
+		RE_SharedTimerSync:FireClient(plr, { startEpoch = sharedTimerStart })
+	end
+end
+
+local function onPlayerRemoving(plr)
+	if matchEnded then return end
+	local c = countTeams()
+	local total = c[GameConfig.TEAM.CIS] + c[GameConfig.TEAM.REP]
+	-- If only one player remains total and they destroyed enemy CC already handled by OnCommandCenterDestroyed
+	-- Handle team empty condition only if we previously had 2+ players
+	if hadAtLeastTwoPlayers then
+		local cisEmpty = (c[GameConfig.TEAM.CIS] == 0)
+		local repEmpty = (c[GameConfig.TEAM.REP] == 0)
+		if cisEmpty ~= repEmpty then
+			-- Exactly one team empty
+			local emptyTid = cisEmpty and GameConfig.TEAM.CIS or GameConfig.TEAM.REP
+			emptyTeamDeadline = { teamId = emptyTid, at = os.clock() + 60 }
+		end
+	end
+end
+
+-- Watchdog for empty-team deadline
+RunService.Heartbeat:Connect(function()
+	if matchEnded then return end
+	if emptyTeamDeadline then
+		local c = countTeams()
+		-- Cancel if team is no longer empty
+		if c[emptyTeamDeadline.teamId] > 0 then
+			emptyTeamDeadline = nil
+			return
+		end
+		if os.clock() >= emptyTeamDeadline.at then
+			-- Opposite team wins
+			local winner = (emptyTeamDeadline.teamId == GameConfig.TEAM.REP) and GameConfig.TEAM.CIS or GameConfig.TEAM.REP
+			announceWin(winner, "TeamEmptyTimeout")
+			emptyTeamDeadline = nil
+		end
+	end
+end)
+
+function WinService:Init()
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+	-- Initialize for already present players
+	for _, plr in ipairs(Players:GetPlayers()) do onPlayerAdded(plr) end
+end
+
+return WinService

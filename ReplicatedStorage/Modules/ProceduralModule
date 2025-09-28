@@ -1,0 +1,113 @@
+-- Autor: Roox4
+-- Modifiziert mit Debugging und Korrekturen
+
+local ProceduralModule = {}
+
+--// Gibt eine CFrame-Rotation zwischen zwei Vektoren zurück
+--// Credit: @EgoMoose (Roblox)
+function ProceduralModule:getRotationBetween(u, v)
+	local randomAxis = Vector3.new(1, 0, 0)
+
+	local dot = u:Dot(v)
+	if (dot > 0.99999) then
+		return CFrame.new()
+	elseif (dot < -0.99999) then
+		return CFrame.fromAxisAngle(randomAxis, math.pi)
+	end
+
+	return CFrame.fromAxisAngle(u:Cross(v), math.acos(dot))
+end
+
+
+
+
+
+--[[
+Parameter:
+ikTarget -> Referenz zum IK-Ziel eines Beines
+ikRayPart -> Referenz zum Raycast-Teil eines Beines
+root -> Das Root-Part des Models (PrimaryPart)
+stepDistance -> Distanz, die das Model zurücklegen muss, bevor diese Funktion einen Schritt auslöst
+stepForward -> Länge des Schritts nach vorne
+stepHeight -> Maximale Höhe, die das Bein beim Schreiten erreicht
+stepWait -> Dauer des Schritts (z.B. 0.05)
+rayCastParams -> Referenz zu den RaycastParams
+--]]
+
+function ProceduralModule:IkLegStep(ikTarget: BasePart, ikRayPart: BasePart, root: BasePart, stepDistance: number, stepForward: number, stepHeight: number, stepWait: number, rayCastParams: RaycastParams)
+	stepWait = stepWait or 0.05
+	stepForward = stepForward or 0
+	stepHeight = stepHeight or 2
+
+	-- DEBUG: Zeige Startpunkt des Raycasts
+	-- print("Raycasting for:", ikTarget.Name, "from:", ikRayPart.Position)
+
+	local rayCast = workspace:Raycast(ikRayPart.Position, Vector3.new(0, -1000, 0), rayCastParams)
+
+	-- DEBUG: Zeige Raycast-Ergebnis
+	-- if not rayCast then
+	--	print("  -> Raycast FAILED for", ikTarget.Name)
+	-- else
+	--	print("  -> Raycast HIT:", rayCast.Instance:GetFullName(), "at:", rayCast.Position, "Normal:", rayCast.Normal)
+	-- end
+
+	if rayCast then
+		local currentGroundPos = rayCast.Position -- Aktuelle Bodenposition
+
+		-- Initialisiere PreviousPos nur, wenn es noch nicht existiert, mit der aktuellen Bodenposition
+		if not ikTarget:GetAttribute("PreviousPos") then
+			-- print("Initializing PreviousPos for", ikTarget.Name, "to", currentGroundPos)
+			ikTarget:SetAttribute("PreviousPos", currentGroundPos)
+			ikTarget.Position = currentGroundPos -- Setze auch die Startposition des IK-Targets
+		end
+
+		local previousFootPos = ikTarget:GetAttribute("PreviousPos")
+
+		-- Sicherheitscheck: Ist es wirklich ein Vector3? (Falls Attribut beschädigt wird)
+		if typeof(previousFootPos) ~= "Vector3" then
+			warn("PreviousPos attribute for", ikTarget.Name, "was not a Vector3! Re-initializing.")
+			previousFootPos = currentGroundPos
+			ikTarget:SetAttribute("PreviousPos", previousFootPos)
+			ikTarget.Position = currentGroundPos
+		end
+
+		-- Berechne Unterschied zur vorherigen Position des Fußes auf dem Boden
+		-- Wir vergleichen, wo der Fuß sein *sollte* (currentGroundPos) mit wo er *war* (previousFootPos)
+		local diff = (currentGroundPos - previousFootPos).Magnitude
+		-- print(ikTarget.Name, "Diff:", diff, "StepDistance:", stepDistance) -- Debug für Distanz
+
+		--// Mache einen Schritt, wenn die Distanz groß genug ist
+		if diff > stepDistance then
+			-- print("Stepping:", ikTarget.Name) -- Debug für Schritt
+
+			-- Berechne die Zielposition: Aktuelle Bodenposition + Schritt nach vorne relativ zur Körperausrichtung
+			local finalFootPos = currentGroundPos + root.CFrame.LookVector * stepForward
+			-- Berechne die höchste Position des Schritts (Bogen)
+			local middleFootPos = ((finalFootPos - previousFootPos) * 0.75 + previousFootPos) + Vector3.new(0, stepHeight, 0)
+
+			-- Führe den Schritt als Coroutine aus, um das Hauptskript nicht zu blockieren
+			coroutine.wrap(function()
+				-- TODO: TweenService für weichere Bewegung verwenden
+				ikTarget.Position = middleFootPos
+				task.wait(stepWait)
+				ikTarget.Position = finalFootPos
+
+				-- Wichtig: Aktualisiere PreviousPos *nach* dem Schritt auf die neue Endposition
+				ikTarget:SetAttribute("PreviousPos", finalFootPos)
+				-- print(ikTarget.Name, "stepped. New PreviousPos:", finalFootPos)
+			end)()
+			-- else -- Optional: Wenn kein Schritt gemacht wird, Fuß an aktueller Bodenposition "festkleben"?
+			-- Wenn der Fuß nicht springen soll, wenn der Körper sich leicht bewegt:
+			-- ikTarget.Position = currentGroundPos
+			-- ikTarget:SetAttribute("PreviousPos", currentGroundPos) -- Halte PreviousPos aktuell
+		end
+	else
+		-- Raycast hat nichts getroffen, Bein kann nicht platziert werden.
+		-- Hier könnte man eine Standardposition oder Logik hinzufügen, falls gewünscht.
+		-- Zum Beispiel das Bein leicht anheben.
+		-- print("Raycast failed for", ikTarget.Name, "- Leg position not updated.")
+	end
+end
+
+
+return ProceduralModule

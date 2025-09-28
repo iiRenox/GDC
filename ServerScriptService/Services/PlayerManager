@@ -1,0 +1,89 @@
+-- ModuleScript
+-- PlayerManager in ServerScriptService/Services
+-- Verwaltet Spielerdaten auf dem Server
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GameConfig = require(ReplicatedStorage.GameConfig)
+
+local PlayerManager = {}
+local playerData = {}
+
+local function setupLeaderstats(player: Player)
+	if player:FindFirstChild("leaderstats") then return end
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = player
+	local bits = Instance.new("IntValue")
+	bits.Name = "Bits"
+	bits.Value = GameConfig.STARTING_BITS
+	bits.Parent = leaderstats
+end
+
+function PlayerManager.AddPlayer(player: Player, teamId: number)
+	if playerData[player] then return end
+	setupLeaderstats(player)
+	playerData[player] = { TeamId = teamId }
+	print(string.format("Spieler %s wurde im PlayerManager für Team %d registriert.", player.Name, teamId))
+    -- Ensure team color and team assignment are reflected on Player object
+    local TeamsService = game:GetService("Teams")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local cfg = require(ReplicatedStorage.GameConfig)
+    local targetTeamName = cfg.Teams[teamId] and cfg.Teams[teamId].Name
+    if targetTeamName then
+        local t = TeamsService:FindFirstChild(targetTeamName)
+        if t then player.Team = t end
+    end
+end
+
+function PlayerManager.RemovePlayer(player: Player)
+	if playerData[player] then
+		print("Spieler", player.Name, "aus PlayerManager entfernt.")
+		playerData[player] = nil
+	end
+end
+
+function PlayerManager.GetTeamId(player: Player) return playerData[player] and playerData[player].TeamId or nil end
+function PlayerManager.GetBits(player: Player) local leaderstats = player:FindFirstChild("leaderstats"); local bits = leaderstats and leaderstats:FindFirstChild("Bits"); return bits and bits.Value or 0 end
+function PlayerManager.AddBits(player: Player, amount: number) local leaderstats = player:FindFirstChild("leaderstats"); local bits = leaderstats and leaderstats:FindFirstChild("Bits"); if bits and amount > 0 then bits.Value += amount; return true end; return false end
+function PlayerManager.SpendBits(player: Player, amount: number) local leaderstats = player:FindFirstChild("leaderstats"); local bits = leaderstats and leaderstats:FindFirstChild("Bits"); if bits and amount > 0 and bits.Value >= amount then bits.Value -= amount; return true end; return false end
+
+function PlayerManager.Initialize()
+	playerData = {}
+	print("PlayerManager Initialisiert.")
+end
+
+-- New API per §8-C
+function PlayerManager.SpawnCharacterForPlayer(player: Player, optionalCFrame: CFrame?)
+    if not player or not player.Parent then return false end
+    if optionalCFrame then
+        player:LoadCharacter()
+        local char = player.Character
+        if char then char:PivotTo(optionalCFrame) end
+        return char ~= nil
+    else
+        player:LoadCharacter()
+        return player.Character ~= nil
+    end
+end
+
+function PlayerManager.ReplaceCharacterModel(player: Player, modelName: string)
+    -- Note: actual replacing is handled by GameManager spawn flow; this keeps API for future integration
+    warn("ReplaceCharacterModel is not yet wired; GameManager handles character spawning.")
+    return false
+end
+
+function PlayerManager.HasBits(player: Player, cost: number)
+    return PlayerManager.GetBits(player) >= (cost or 0)
+end
+
+function PlayerManager.ModifyBits(player: Player, delta: number, reason: string)
+    if delta == 0 then return true end
+    if delta > 0 then
+        return PlayerManager.AddBits(player, delta)
+    else
+        return PlayerManager.SpendBits(player, -delta)
+    end
+end
+
+return PlayerManager

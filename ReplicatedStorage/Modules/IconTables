@@ -1,0 +1,68 @@
+-- File: ReplicatedStorage/Modules/IconTables
+-- Summary: Editable icon mapping tables per category and building. Paste your asset IDs here.
+
+local IconTables = {}
+
+-- Category icons (menu), keyed by index. Team-specific can be set by side key.
+IconTables.Category = {
+	[1] = { generic = "Images/Ground" },
+	[2] = { rep = "Images/Rep_Support_SmallAir", cis = "Images/CIS_Support_SmallAir" },
+	[3] = { rep = "Images/Rep_Barracks", cis = "Images/CIS_Barracks" },
+	[4] = { rep = "Images/Rep_Support_Air", cis = "Images/CIS_Support_Air" },
+	[5] = { generic = "Images/Shield" },
+	[6] = { generic = "Images/RayShieldGen" },
+	[7] = { generic = "Torpedo" },
+	[8] = { generic = "Images/Extra" },
+}
+
+-- Building icons (items) map prefab names to IconAssetIds keys
+IconTables.Building = {
+	-- CIS
+	CIS_Barracks_Droid = "Images/CIS_Droid",
+	CIS_Barracks_Rocket_Droid = "Images/CIS_Rocket_Droid",
+	CIS_Support_SmallAir_DroidSpider = "Images/Droid_Spider",
+	CIS_Support_Air_HailFire = "Images/HailFire",
+	CIS_Support_Air_AAT = "Images/AAT",
+	CIS_Support_Air_SuperTank = "Images/SuperTank",
+	CIS_Support_Air_HomingSpider = "Images/HomingSpider",
+
+	-- REP
+	Rep_Barracks_Clone = "Images/Rep_Clone",
+	Rep_Barracks_Rocket_Clone = "Images/Rep_Rocket_Clone",
+	Rep_Support_SmallAir_AT_RT = "Images/AT_RT",
+	Rep_Support_SmallAir_AT-RT = "Images/AT_RT",
+	Rep_Support_Air_AT_ST = "Images/AT_ST",
+	Rep_Support_Air_AT-ST = "Images/AT_ST",
+	Rep_Support_Air_LaserTank = "Images/Lasertank",
+	Rep_Support_Air_AT_TE = "Images/AT_TE",
+	Rep_Support_Air_AT-TE = "Images/AT_TE",
+
+	-- Tesla (both sides use same icons)
+	Rep_Tesla_Normal = "Images/Tesla_Normal",
+	Rep_Tesla_Silver = "Images/Tesla_Silver",
+	Rep_Tesla_Gold = "Images/Tesla_Gold",
+	CIS_Tesla_Normal = "Images/Tesla_Normal",
+	CIS_Tesla_Silver = "Images/Tesla_Silver",
+	CIS_Tesla_Gold = "Images/Tesla_Gold",
+
+	-- Torpedoes (both sides)
+	Rep_Torpedo_Normal = "Images/Torpedo_Normal",
+	Rep_Torpedo_Silver = "Images/Torpedo_Silver",
+	Rep_Torpedo_Gold = "Images/Torpedo_Gold",
+	CIS_Torpedo_Normal = "Images/Torpedo_Normal",
+	CIS_Torpedo_Silver = "Images/Torpedo_Silver",
+	CIS_Torpedo_Gold = "Images/Torpedo_Gold",
+
+	-- Generic
+	BitWell = "Images/BitWell",
+	Torpedo_Normal = "Images/Torpedo_Normal",
+	Torpedo_Silver = "Images/Torpedo_Silver",
+	Torpedo_Gold = "Images/Torpedo_Gold",
+	RayShieldGen_Normal = "Images/RayShieldGen",
+	RayShieldGen_Silver = "Images/RayShieldGen",
+	RayShieldGen_Gold = "Images/RayShieldGen",
+}
+
+return IconTables
+
+

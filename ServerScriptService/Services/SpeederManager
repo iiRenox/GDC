@@ -1,0 +1,243 @@
+-- ModuleScript
+-- SpeederManager in ServerScriptService/Services - MIT CLIENT-SEITIGEN EFFEKTEN
+
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local GameConfig = require(ReplicatedStorage.GameConfig)
+local PlayerManager = require(script.Parent.PlayerManager)
+local serverToAllClientsUpdate = ReplicatedStorage.Remotes.ServerToAllClientsUpdate -- Wichtig für Effekte
+local SoundsFolder = ReplicatedStorage:FindFirstChild("Sounds")
+local CombatService = require(script.Parent:WaitForChild("CombatService"))
+
+
+local SpeederManager = {}
+local activeSpeeders, playerInputs, currentSpeederSpeeds, currentSpeederYaw = {}, {}, {}, {}
+
+local HOVER_HEIGHT = 176.4; local MAX_SPEED = 65; local BOOST_MULTIPLIER = 1.55; local TURN_SPEED = 0.04
+local ACCELERATION = 6; local DECELERATION = 12
+
+local PROJECTILE_SPEED = 300; local PROJECTILE_LIFETIME = 2; local PROJECTILE_DAMAGE = 1
+local PROJECTILE_SIZE = Vector3.new(0.3, 0.3, 5)
+
+function SpeederManager:HandleEnterRequest(player, speeder)
+	if not speeder or not speeder.Parent or activeSpeeders[player] ~= speeder then return end
+	local hrp = speeder:FindFirstChild("HumanoidRootPart"); local vehicleSeat = speeder:FindFirstChild("VehicleSeat")
+	if hrp and vehicleSeat and not vehicleSeat.Occupant then
+		hrp.Anchored = false; vehicleSeat:Sit(player.Character.Humanoid); hrp:SetNetworkOwner(player)
+	end
+end
+
+function SpeederManager:SpawnSpeederForPlayer(player, teamId)
+	if activeSpeeders[player] then activeSpeeders[player]:Destroy() end
+	if not player.Character then return end
+	local teamConfig = GameConfig.Teams[teamId]
+	local speederPrefab = ServerStorage.UnitPrefabs:FindFirstChild(teamConfig.SpeederModelName)
+	if not speederPrefab then warn("Speeder-Prefab", teamConfig.SpeederModelName, "nicht gefunden!"); return end
+	local speeder = speederPrefab:Clone(); speeder.Name = player.Name .. "_Speeder"
+	CollectionService:AddTag(speeder, "Speeder")
+	local hrp = speeder:FindFirstChild("HumanoidRootPart"); local vehicleSeat = speeder:FindFirstChild("VehicleSeat")
+	if not (hrp and vehicleSeat) then warn("FEHLER:", speederPrefab.Name, "Prefab hat kein HRP/VehicleSeat!"); speeder:Destroy(); return end
+	hrp.Anchored = true
+	local prompt = Instance.new("ProximityPrompt", vehicleSeat)
+	prompt.ActionText = "Einsteigen"; prompt.ObjectText = teamConfig.Name .. " Speeder"; prompt.KeyboardKeyCode = Enum.KeyCode.E
+	speeder:SetPrimaryPartCFrame((player.Character or workspace):GetPivot() * CFrame.new(5, 5, 5))
+	speeder.Parent = Workspace; activeSpeeders[player] = speeder
+	local _, y, _ = hrp.CFrame:ToOrientation(); currentSpeederYaw[speeder] = y
+	vehicleSeat:GetPropertyChangedSignal("Occupant"):Connect(function()
+		if not vehicleSeat.Occupant then
+			-- Re-enable entry prompt when seat is empty
+			if prompt and prompt.Parent then prompt.Enabled = true end
+			hrp.Anchored = true; if not hrp.Anchored then hrp:SetNetworkOwnershipAuto() end
+			local engine = hrp:FindFirstChild("EngineSound")
+			if engine then
+				if engine.IsPlaying then engine:Stop() end
+				engine:Destroy()
+			end
+			-- hard cleanup in case multiple engine sounds linger
+			for _, s in ipairs(hrp:GetDescendants()) do if s:IsA("Sound") and s.Name == "EngineSound" then s:Stop(); s:Destroy() end end
+		else
+			-- Disable entry prompt while occupied
+			if prompt then prompt.Enabled = false end
+			-- Ensure engine sound exists for current occupant and faction
+			local engine = hrp:FindFirstChild("EngineSound")
+			if not engine then
+				local occHum = vehicleSeat.Occupant
+				local occPlayer = occHum and occHum.Parent and game:GetService("Players"):GetPlayerFromCharacter(occHum.Parent) or nil
+				local occTeamId = occPlayer and PlayerManager.GetTeamId(occPlayer)
+				local engineTemplateName = (occTeamId == (GameConfig.TEAM and GameConfig.TEAM.REP)) and "Rep_Speeder" or "CIS_Speeder"
+				local engineTemplate = SoundsFolder and SoundsFolder:FindFirstChild(engineTemplateName)
+				if engineTemplate then
+					engine = engineTemplate:Clone()
+					engine.Name = "EngineSound"
+					engine.Looped = true
+					engine.Volume = engine.Volume > 0 and engine.Volume or 0.4
+					engine.Parent = hrp
+				end
+			end
+			if engine and not engine.IsPlaying then engine:Play() end
+		end
+	end)
+	local health = speeder:FindFirstChild("Health"); if health then health.Changed:Connect(function(val) if val <= 0 and speeder.Parent then speeder:Destroy(); task.delay(GameConfig.SPEEPER_RESPAWN_TIME, function() if player and player.Parent and PlayerManager.GetTeamId(player) then self:SpawnSpeederForPlayer(player, PlayerManager.GetTeamId(player)) end end) end end) end
+
+	-- Do not pre-create engine sound; create on enter and destroy on exit to avoid leftovers
+end
+function SpeederManager:HandleFireRequest(player, muzzleCFrame)
+	local projectile = Instance.new("Part"); projectile.Size = PROJECTILE_SIZE; projectile.CFrame = muzzleCFrame; projectile.BrickColor = BrickColor.new("Bright red"); projectile.Material = Enum.Material.Neon; projectile.CanCollide = false; projectile.CanTouch = true;
+	projectile.Anchored = false; projectile.Name = "SpeederLaser"
+	local bv = Instance.new("BodyVelocity"); bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge); bv.Velocity = muzzleCFrame.LookVector * PROJECTILE_SPEED; bv.Parent = projectile
+	projectile.Parent = Workspace; projectile:SetNetworkOwner(player)
+	-- Invisible larger hitbox welded to the projectile to increase hit registration
+	local hitbox = Instance.new("Part")
+	hitbox.Name = "SpeederLaser_Hitbox"
+	hitbox.Size = Vector3.new(6, 8, math.max(7, PROJECTILE_SIZE.Z + 2))
+	hitbox.CFrame = muzzleCFrame
+	hitbox.Anchored = false
+	hitbox.CanCollide = false
+	hitbox.CanTouch = true
+	hitbox.Transparency = 1
+	hitbox.Material = Enum.Material.Neon
+	hitbox.Parent = Workspace
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = projectile
+	weld.Part1 = hitbox
+	weld.Parent = projectile
+	-- Ensure hitbox follows the same network owner as the projectile
+	pcall(function()
+		hitbox:SetNetworkOwner(player)
+	end)
+	-- Play fire sound (server-side spatial)
+	local fireSound = SoundsFolder and SoundsFolder:FindFirstChild("SpeederFire")
+	if fireSound and fireSound:IsA("Sound") then
+		local s = fireSound:Clone(); s.Parent = projectile; s:Play(); game:GetService("Debris"):AddItem(s, 5)
+	end
+	Debris:AddItem(projectile, PROJECTILE_LIFETIME)
+	Debris:AddItem(hitbox, PROJECTILE_LIFETIME)
+
+	local processed = false
+	local conn1, conn2
+	local function onTouch(hit)
+		if processed then return end
+		local hitModel = hit:FindFirstAncestorWhichIsA("Model")
+		-- Ignore self hits (own speeder/character/projectiles)
+		if hitModel == activeSpeeders[player] or hitModel == player.Character or hit.Name == "SpeederLaser" or hit.Name == "SpeederLaser_Hitbox" then return end
+		-- Compute more accurate impact position
+		local dir = bv.Velocity.Magnitude > 0 and bv.Velocity.Unit or projectile.CFrame.LookVector
+		local rc = workspace:Raycast(projectile.Position - dir * 1, dir * 3)
+		local impactPos = rc and rc.Position or projectile.Position
+		-- Play one impact effect at contact point
+		serverToAllClientsUpdate:FireAllClients("PlayEffect", "LaserImpact", impactPos)
+		local hitHumanoid = hitModel and hitModel:FindFirstChildOfClass("Humanoid")
+		local hitHealth = hitModel and hitModel:FindFirstChild("Health")
+		if hitHumanoid or hitHealth then
+			if hitHumanoid then
+				-- Friendly-fire guard for players
+				local atkTeam = player.Team and player.Team.Name or nil
+				local targetPlayer = game:GetService("Players"):GetPlayerFromCharacter(hitModel)
+				if targetPlayer and targetPlayer.Team and targetPlayer.Team.Name == atkTeam then
+					-- ignore friendly humanoid
+				else
+					hitHumanoid:TakeDamage(PROJECTILE_DAMAGE)
+				end
+			elseif hitHealth then
+				-- Early-out friendly check for building-like models with OwnerTeam
+				local ownerTid = hitModel:GetAttribute("OwnerTeam")
+				local atkTid = PlayerManager.GetTeamId(player)
+				if ownerTid and atkTid and ownerTid == atkTid then
+					-- ignore friendly building/asset
+					return
+				end
+				local isBuilding = hitModel:GetAttribute("IsBuilding") == true
+				if isBuilding then
+					-- Route through CombatService to honor immunities and friendly-fire
+					local damageType = CombatService.DamageType and CombatService.DamageType.Laser or "Laser"
+					CombatService:ApplyDamage(player.Character or projectile, hit, PROJECTILE_DAMAGE, damageType)
+				else
+					-- Non-building health (e.g., vehicles): allow damage
+					hitHealth.Value = math.max(0, hitHealth.Value - PROJECTILE_DAMAGE)
+				end
+			end
+			local hitS = SoundsFolder and SoundsFolder:FindFirstChild("HitSound")
+			if hitS and hitS:IsA("Sound") then local s = hitS:Clone(); s.Parent = projectile; s:Play(); game:GetService("Debris"):AddItem(s, 3) end
+		end
+		processed = true
+		projectile.CanTouch = false
+		projectile.Transparency = 1
+		projectile:Destroy()
+		if hitbox and hitbox.Parent then hitbox:Destroy() end
+		if conn1 then conn1:Disconnect(); conn1 = nil end
+		if conn2 then conn2:Disconnect(); conn2 = nil end
+	end
+
+	conn1 = projectile.Touched:Connect(onTouch)
+	conn2 = hitbox.Touched:Connect(onTouch)
+end
+
+function SpeederManager:UpdatePlayerInput(player, inputTable)
+	if activeSpeeders[player] then playerInputs[player] = inputTable end
+end
+
+function SpeederManager:StartUpdateLoop()
+	print("SpeederManager: Server-seitige PHYSIK-SCHLEIFE gestartet.")
+	RunService.Heartbeat:Connect(function(deltaTime)
+		for player, speeder in pairs(activeSpeeders) do
+			local hrp = speeder:FindFirstChild("HumanoidRootPart")
+			if not hrp or hrp.Anchored or not speeder.Parent then continue end
+			local alignPos = hrp.MoverParts.AlignPosition; local alignOrient = hrp.MoverParts.AlignOrientation
+			local inputs = playerInputs[player] or { Throttle = 0, Steer = 0, Boosting = false }
+
+			local currentSpeed = currentSpeederSpeeds[speeder] or 0
+			local targetSpeed = MAX_SPEED * inputs.Throttle
+			if inputs.Boosting then targetSpeed = targetSpeed * BOOST_MULTIPLIER end
+
+			local newSpeed = currentSpeed
+			if targetSpeed > currentSpeed then newSpeed = math.min(targetSpeed, currentSpeed + ACCELERATION)
+			elseif targetSpeed < currentSpeed then newSpeed = math.max(targetSpeed, currentSpeed - DECELERATION) end
+			currentSpeederSpeeds[speeder] = newSpeed
+
+			local moveDirection = hrp.CFrame.LookVector
+			hrp.AssemblyLinearVelocity = Vector3.new(moveDirection.X * newSpeed, hrp.AssemblyLinearVelocity.Y, moveDirection.Z * newSpeed)
+
+			if not currentSpeederYaw[speeder] then local _, y, _ = hrp.CFrame:ToOrientation(); currentSpeederYaw[speeder] = y end
+			currentSpeederYaw[speeder] = currentSpeederYaw[speeder] - (inputs.Steer * TURN_SPEED * deltaTime * 60)
+
+			alignOrient.CFrame = CFrame.fromOrientation(0, currentSpeederYaw[speeder], 0)
+			alignPos.Position = Vector3.new(hrp.Position.X, HOVER_HEIGHT, hrp.Position.Z)
+
+			local vehicleSeat = speeder:FindFirstChild("VehicleSeat")
+
+			-- Engine sound control (play when occupied; modulate volume by speed)
+			local engine = hrp:FindFirstChild("EngineSound")
+			if engine then
+				local occupied = vehicleSeat and vehicleSeat.Occupant ~= nil
+				local speedFrac = math.clamp(math.abs(newSpeed) / MAX_SPEED, 0, 1)
+				local targetVolume = occupied and (0.15 + 0.225 * speedFrac) or 0
+				if occupied then
+					if not engine.IsPlaying then engine:Play() end
+					engine.Volume = targetVolume
+				else
+					if engine.IsPlaying then engine:Stop() end
+				end
+			end
+		end
+	end)
+end
+
+function SpeederManager:CheckAndRespawnSpeeder(player, teamId) if not player.Character or not player.Character.PrimaryPart then return end; local currentSpeeder = activeSpeeders[player]; if not currentSpeeder or not currentSpeeder.Parent then self:SpawnSpeederForPlayer(player, teamId) else if currentSpeeder.PrimaryPart and (player.Character.PrimaryPart.Position - currentSpeeder.PrimaryPart.Position).Magnitude > 150 then currentSpeeder:Destroy() end end end
+Players.PlayerRemoving:Connect(function(player) if activeSpeeders[player] then if currentSpeederYaw and currentSpeederYaw[activeSpeeders[player]] then currentSpeederYaw[activeSpeeders[player]] = nil end; activeSpeeders[player]:Destroy(); activeSpeeders[player] = nil end; playerInputs[player] = nil end)
+
+function SpeederManager:GetActiveSpeedersList()
+	local list = {}
+	for _, speeder in pairs(activeSpeeders) do
+		table.insert(list, speeder)
+	end
+	return list
+end
+
+SpeederManager:StartUpdateLoop()
+return SpeederManager

@@ -1,0 +1,182 @@
+-- Hauptskript (Script im HomingSpider Model) - OHNE Dynamische HipHeight - ANGEPASST FÜR 4-BEIN GANG
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+-- WICHTIG: Stelle sicher, dass dieses Modul die Version OHNE TweenService ist!
+local ProceduralModule = require(ReplicatedStorage:WaitForChild("ProceduralModule"))
+
+local HomingSpider = script.Parent -- Umbenannt
+local root = HomingSpider:FindFirstChild("HumanoidRootPart")
+local hum = HomingSpider:FindFirstChild("Humanoid")
+local alignOrientation = root:FindFirstChild("AlignOrientation")
+
+local target = Workspace:FindFirstChild("Target")
+
+-- // Konfiguration für Homing Spider (WERTE ANPASSEN!)
+local BASE_HIPHEIGHT = 5            -- FIXE Grundhöhe (Spinnen sind oft niedrig! MESSEN!)
+
+local STEP_DISTANCE = 3             -- Auslösedistanz (Etwas höher, da stabiler)
+local STEP_FORWARD_LENGTH = 4       -- Länge des Schritts (Moderat)
+local BASE_STEP_HEIGHT = 0.6          -- Grundhöhe des Schrittbogens (Nicht zu hoch)
+local STEP_WAIT_DURATION = 0.05     -- Dauer der Pause im Schrittbogen (Kurz! NICHT-Tween-Version)
+local PAUSE_BETWEEN_DIAGONALS = 0.07 -- Pause zwischen dem Bewegen der diagonalen Paare (Rhythmus)
+
+-- // Konfiguration für Körperbewegung (Subtiles Schwanken)
+local BODY_SWAY_ROLL_ANGLE = math.rad(20)   -- Leichtes seitliches Schwanken
+local BODY_SWAY_YAW_ANGLE = math.rad(20)  -- Leichtes Drehen
+local BODY_SWAY_FREQUENCY = 15        -- Geschwindigkeit des Schwankens
+local BODY_SWAY_SMOOTHING = 16        -- Wie schnell das Schwanken angepasst wird / aufhört
+
+-- Überprüfe, ob wichtige Teile vorhanden sind
+if not root or not hum or not alignOrientation or not target then
+	warn("HomingSpider Script: Ein oder mehrere notwendige Objekte fehlen...")
+	return
+end
+
+--// Lade benötigte Beinteile sicher
+local ikTargetsFolder = HomingSpider:WaitForChild("IkTargets", 5)
+local raycastPartsFolder = HomingSpider:WaitForChild("RaycastParts", 5)
+if not ikTargetsFolder or not raycastPartsFolder then
+	warn("FEHLER: IkTargets oder RaycastParts Ordner nicht gefunden!")
+	return
+end
+
+local ikTargets = {}
+local raycastParts = {}
+local ikControls = {}
+local poles = {}
+-- WICHTIG: Passe diese Namen an dein Modell an!
+local requiredLegs = {"LeftFront", "RightFront", "LeftBack", "RightBack"}
+local allPartsFound = true
+
+print("Überprüfe benötigte Teile für Homing Spider...")
+for _, legName in ipairs(requiredLegs) do
+	ikTargets[legName] = ikTargetsFolder:FindFirstChild(legName .. "_IkTarget")
+	raycastParts[legName] = raycastPartsFolder:FindFirstChild(legName .. "_RaycastPart")
+	ikControls[legName] = hum:FindFirstChild(legName .. "_IKControl")
+	poles[legName] = root:FindFirstChild(legName .. "_Pole")
+
+	if not ikTargets[legName] then warn("FEHLER: IK Target '" .. legName .. "_IkTarget' fehlt!"); allPartsFound = false end
+	if not raycastParts[legName] then warn("FEHLER: Raycast Part '" .. legName .. "_RaycastPart' fehlt!"); allPartsFound = false end
+	if not ikControls[legName] then warn("FEHLER: IK Control '" .. legName .. "_IKControl' fehlt!"); allPartsFound = false end
+	if not poles[legName] then warn("FEHLER: Pole '" .. legName .. "_Pole' fehlt!"); allPartsFound = false end
+end
+
+if not allPartsFound then
+	warn("--------------------------------------------------------------------------")
+	warn("HomingSpider Script: Nicht alle benötigten Bein-Komponenten gefunden. Script wird beendet.")
+	warn("Benötigt werden: " .. table.concat(requiredLegs, ", ") .. " (mit _IkTarget, _RaycastPart, _IKControl, _Pole)")
+	warn("--------------------------------------------------------------------------")
+	return
+end
+print("HomingSpider Script: Alle benötigten Teile wurden erfolgreich gefunden.")
+
+-- Weise Poles zu
+for legName, control in pairs(ikControls) do
+	control.Pole = poles[legName]
+	if control.Type ~= Enum.IKControlType.Position then
+		warn("IKControl Type für", legName, "war nicht Position. Setze auf Position.")
+		control.Type = Enum.IKControlType.Position
+	end
+end
+
+--// RaycastParams
+local rayCastParams = RaycastParams.new()
+rayCastParams.FilterDescendantsInstances = {HomingSpider} -- Angepasst
+rayCastParams.FilterType = Enum.RaycastFilterType.Exclude
+rayCastParams.IgnoreWater = true
+
+-- Setze Transparenz für Debugging
+for _, v in pairs(ikTargets) do if v:IsA("BasePart") then v.Transparency = 0 end end
+for _, v in pairs(raycastParts) do if v:IsA("BasePart") then v.Transparency = 0 end end
+for _, v in pairs(poles) do if v:IsA("BasePart") then v.Transparency = 0; v.Size = Vector3.new(1,1,1) end end
+
+-- Initialisiere Humanoid-Eigenschaften
+hum.WalkSpeed = 24 -- Geschwindigkeit anpassen
+hum.HipHeight = BASE_HIPHEIGHT -- Setze FIXE Höhe EINMALIG hier
+print("HomingSpider HipHeight auf fixen Wert gesetzt:", hum.HipHeight)
+
+-- Bewegung zum Ziel starten
+coroutine.wrap(function()
+	while hum and hum.Parent do
+		hum:MoveTo(target.Position)
+		task.wait(0.25)
+	end
+end)()
+
+-- // Zustand für Körperbewegung (Sway)
+local currentBodyRoll = 30      -- Aktueller Roll-Winkel (Radiant)
+local currentBodyYaw = 30       -- Aktueller Yaw-Winkel (Radiant)
+local walkCycleTime = 30        -- Laufvariable für Sway
+
+-- Körperausrichtung UND Body Sway
+RunService.Heartbeat:Connect(function(deltaTime)
+	if not hum or hum.Health <= 0 then return end
+
+	-- 1. Basis-Körperausrichtung (Boden + Ziel)
+	local baseCFrame = CFrame.identity
+	local bodyRayCast = Workspace:Raycast(root.Position, root.CFrame.UpVector * -1000, rayCastParams)
+	if bodyRayCast then
+		local rotateToFloorCFrame = ProceduralModule:getRotationBetween(root.CFrame.UpVector, bodyRayCast.Normal)
+		local targetLookAt = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
+		local lookAtCFrame = CFrame.lookAt(root.Position, targetLookAt)
+		baseCFrame = rotateToFloorCFrame * lookAtCFrame.Rotation
+	else
+		local targetLookAt = Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)
+		local lookAtCFrame = CFrame.lookAt(root.Position, targetLookAt)
+		baseCFrame = lookAtCFrame.Rotation
+	end
+
+	-- Ist der Walker in Bewegung?
+	local isMoving = hum.MoveDirection.Magnitude > 0.1
+
+	-- 2. Zielwinkel für Sway berechnen (nur wenn in Bewegung)
+	local targetRoll = 30
+	local targetYaw = 30
+	if isMoving then
+		-- Aktualisiere die Laufzeit für die Sinuswelle nur wenn wir uns bewegen
+		walkCycleTime = (walkCycleTime + deltaTime * BODY_SWAY_FREQUENCY) % (2 * math.pi)
+		targetRoll = math.sin(walkCycleTime) * BODY_SWAY_ROLL_ANGLE
+		targetYaw = math.sin(walkCycleTime + math.pi/2) * BODY_SWAY_YAW_ANGLE -- Phasenverschoben für interessantere Bewegung
+	else
+		walkCycleTime = 0 -- Setze zurück, wenn gestoppt
+		-- Wenn nicht in Bewegung, gehen Roll/Yaw zur Mitte zurück
+	end
+
+	-- 3. Aktuelle Winkel sanft anpassen (Lerp)
+	local smoothingFactor = isMoving and BODY_SWAY_SMOOTHING or BODY_SWAY_SMOOTHING * 2 -- Langsameres Ausklingen beim Stoppen
+
+	currentBodyRoll = currentBodyRoll + (targetRoll - currentBodyRoll) * math.min(deltaTime * smoothingFactor, 1)
+	currentBodyYaw = currentBodyYaw + (targetYaw - currentBodyYaw) * math.min(deltaTime * smoothingFactor, 1)
+
+	-- 4. Endgültige Orientierung anwenden (Basis * Yaw * Roll)
+	alignOrientation.CFrame = baseCFrame * CFrame.Angles(0, currentBodyYaw, currentBodyRoll) -- Kein expliziter Pitch
+
+end)
+
+-- Beinschritt-Schleife für Quadruped (diagonale Paare)
+local nextPair = 1 -- Starte mit Paar 1
+while HomingSpider.Parent and hum and hum.Health > 0 do -- Angepasst
+
+	if nextPair == 1 then
+		-- Paar 1: Links Vorne & Rechts Hinten
+		ProceduralModule:IkLegStep(ikTargets.LeftFront, raycastParts.LeftFront, root, STEP_DISTANCE, STEP_FORWARD_LENGTH, BASE_STEP_HEIGHT, STEP_WAIT_DURATION, rayCastParams)
+		ProceduralModule:IkLegStep(ikTargets.RightBack, raycastParts.RightBack, root, STEP_DISTANCE, STEP_FORWARD_LENGTH, BASE_STEP_HEIGHT, STEP_WAIT_DURATION, rayCastParams)
+		nextPair = 2
+	else -- nextPair == 2
+		-- Paar 2: Rechts Vorne & Links Hinten
+		ProceduralModule:IkLegStep(ikTargets.RightFront, raycastParts.RightFront, root, STEP_DISTANCE, STEP_FORWARD_LENGTH, BASE_STEP_HEIGHT, STEP_WAIT_DURATION, rayCastParams)
+		ProceduralModule:IkLegStep(ikTargets.LeftBack, raycastParts.LeftBack, root, STEP_DISTANCE, STEP_FORWARD_LENGTH, BASE_STEP_HEIGHT, STEP_WAIT_DURATION, rayCastParams)
+		nextPair = 1
+	end
+
+	-- Warte die definierte Pause, *nachdem* ein Paar gestartet wurde
+	task.wait(PAUSE_BETWEEN_DIAGONALS)
+
+	-- Stoppe, falls sich der Zustand geändert hat
+	if not (HomingSpider.Parent and hum and hum.Health > 0) then break end -- Angepasst
+
+end
+
+print("HomingSpider Script beendet.") -- Angepasst

@@ -1,0 +1,516 @@
+-- File: ServerScriptService/Services/ResourceManager
+-- Modified/Created by: GPT-5 (Cursor) — 2025-08-08
+-- Based on: Gemini scripts — new service
+-- Summary: Spawns and manages studs (Bits). Provides API to spawn studs and handle pickups.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+local HttpService = game:GetService("HttpService")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local PlayerManager = require(script.Parent:WaitForChild("PlayerManager"))
+local RunService = game:GetService("RunService")
+
+local okSM, SpeederManager = pcall(require, script.Parent:FindFirstChild("SpeederManager"))
+
+local ResourceManager = {}
+local SoundsFolder = ReplicatedStorage:FindFirstChild("Sounds")
+
+local function getStudPrefab()
+	local misc = ServerStorage:FindFirstChild("MiscPrefabs")
+	if misc then
+		local stud = misc:FindFirstChild("Stud")
+		if stud and (stud:IsA("BasePart") or stud:IsA("Model")) then return stud end
+	end	
+	return nil
+end
+
+local plantRockNames = {
+	DeadBush = true,
+	Round_Rock_1 = true,
+	Round_Rock_2 = true,
+	Stone_1 = true,
+	Stone_2 = true,
+}
+
+-- Track resource clusters so we drop studs once per cluster
+local clusterState = {}
+local trackedResources = {}
+
+-- Respawn coordination per spawner
+local spawnerPending = {}
+local spawnerEmptySince = {}
+
+-- Ensure we only respawn once per destroyed cluster
+local function scheduleRespawnForCluster(clusterId: string)
+	local info = clusterState[clusterId]
+	if not info or not info.spawner then return end
+	if info.respawnScheduled then return end
+	info.respawnScheduled = true
+	if info.spawner then spawnerPending[info.spawner] = true end
+	task.delay(15, function()
+		local sp = info.spawner
+		-- remove old cluster entry BEFORE spawning, so SpawnClusterAt doesn't early-return
+		clusterState[clusterId] = nil
+		if sp then spawnerPending[sp] = nil end
+		if sp and sp.Parent then
+			ResourceManager:SpawnClusterAt(sp)
+		end
+	end)
+end
+
+-- Public: spawn one cluster at a specific spawner part (used by ScatterResources and respawns)
+function ResourceManager:SpawnClusterAt(spawnerPart) 
+	local misc = ServerStorage:FindFirstChild("MiscPrefabs")
+	if not (spawnerPart and spawnerPart:IsA("BasePart") and misc) then return end
+	-- Prevent double-spawn if a cluster already exists for this spawner
+	for cid, info in pairs(clusterState) do
+		if info and info.spawner == spawnerPart then return end
+	end
+	local centerWorld = spawnerPart.Position
+	local clusterId = HttpService:GenerateGUID(false)
+	local clusterTotal = math.random(2000, 3000)
+	clusterState[clusterId] = { dropped = false, models = {}, pos = centerWorld, total = clusterTotal, spawner = spawnerPart }
+	-- Any pending marker for this spawner can be cleared once a new cluster is registered
+	spawnerPending[spawnerPart] = nil
+
+	local clusterSize = math.random(3, 4)
+	local placed = {}
+	local MIN_SEPARATION = 10
+	for i = 1, clusterSize do
+		local choices = {}
+		for name, _ in pairs(plantRockNames) do
+			local prefab = misc:FindFirstChild(name)
+			if prefab then table.insert(choices, prefab) end
+		end
+		local prefab = (#choices > 0) and choices[math.random(1, #choices)] or nil
+		if prefab then
+			-- spaced placement with separation attempts
+			local pos
+			local attempts = 0
+			repeat
+				local offset = Vector3.new(math.random(-12, 12), 0, math.random(-12, 12))
+				pos = centerWorld + offset
+				attempts += 1
+				local ok = true
+				for _, ppos in ipairs(placed) do
+					if (ppos - pos).Magnitude < MIN_SEPARATION then ok = false; break end
+				end
+			until ok or attempts > 25
+			table.insert(placed, pos)
+			local clone = prefab:Clone()
+			if clone:IsA("Model") and not clone.PrimaryPart then
+				local base = clone:FindFirstChildWhichIsA("BasePart"); if base then clone.PrimaryPart = base end
+			end
+			if clone:IsA("Model") and clone.PrimaryPart then
+				local upright = CFrame.new(pos) * CFrame.Angles(0, math.rad(math.random(0,359)), 0)
+				clone:PivotTo(upright)
+			elseif clone:IsA("BasePart") then
+				clone.CFrame = CFrame.new(pos)
+			end
+			clone.Parent = Workspace
+			if clone:IsA("Model") then
+				clone:SetAttribute("RM_RespawnPos", centerWorld)
+				clone:SetAttribute("RM_PrefabName", clone.Name)
+				clone:SetAttribute("RM_ClusterId", clusterId)
+				for _, p in ipairs(clone:GetDescendants()) do if p:IsA("BasePart") then p.Anchored = true; p.CanCollide = true end end
+				clusterState[clusterId].models[clone] = true
+			end
+			local rootModel = clone:IsA("Model") and clone or nil
+			if rootModel then
+				rootModel.Destroying:Connect(function() trackedResources[rootModel] = nil end)
+				for _, part in ipairs(rootModel:GetDescendants()) do
+					if part:IsA("BasePart") then
+						part.Touched:Connect(function(hit)
+							if hit.Name == "SpeederLaser" then
+								if rootModel:GetAttribute("RM_Destroying") then return end
+								rootModel:SetAttribute("RM_Destroying", true)
+								local cid = rootModel:GetAttribute("RM_ClusterId")
+								if cid and clusterState[cid] and not clusterState[cid].dropped then
+									clusterState[cid].dropped = true
+									local total = clusterState[cid].total
+									local sfx = SoundsFolder and SoundsFolder:FindFirstChild("BuildingExplosion")
+									if sfx and sfx:IsA("Sound") then local s = sfx:Clone(); s.Parent = rootModel.PrimaryPart or rootModel; s:Play(); Debris:AddItem(s, 5) end
+									spawnStudPieces(clusterState[cid].pos, total, 32, 15)
+								end
+                                for _, p in ipairs(rootModel:GetDescendants()) do if p:IsA("BasePart") then p.Anchored = false; p.CanCollide = true; p.Transparency = 0.25 end end
+								task.delay(1.7, function() if rootModel and rootModel.Parent then rootModel:Destroy() end end)
+								if cid then scheduleRespawnForCluster(cid) end
+							end
+						end)
+					end
+				end
+			end
+		end
+	end
+end
+
+function ResourceManager:ScatterResources()
+	local map = Workspace:FindFirstChild("Ryloth")
+	local misc = ServerStorage:FindFirstChild("MiscPrefabs")
+	if not map or not misc then return end
+	local cfFolder = map:FindFirstChild("Cluster_Folder")
+	if not cfFolder then return end
+
+	-- Clear any previous clusters state
+	clusterState = {}
+
+	for _, sp in ipairs(cfFolder:GetChildren()) do
+		if sp:IsA("BasePart") then self:SpawnClusterAt(sp) end
+	end
+end
+
+local function createFallbackStud()
+	local p = Instance.new("Part")
+	p.Name = "Stud"
+	p.Size = Vector3.new(0.6, 0.2, 0.6)
+	p.Shape = Enum.PartType.Cylinder
+	p.Material = Enum.Material.Neon
+	p.Color = Color3.fromRGB(255, 223, 0)
+	p.CanCollide = false
+	p.Anchored = false
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	return p
+end
+
+local function attachValue(part, value)
+	local v = Instance.new("IntValue")
+	v.Name = "StudValue"
+	v.Value = value
+	v.Parent = part
+end
+
+local function hookPickup(partOrModel)
+	local touchedDebounce = false
+	local part = partOrModel:IsA("Model") and (partOrModel.PrimaryPart or partOrModel:FindFirstChildWhichIsA("BasePart")) or partOrModel
+	if not part or not part:IsA("BasePart") then return end
+	part.Touched:Connect(function(hit)
+		if touchedDebounce then return end
+		local character = hit:FindFirstAncestorOfClass("Model")
+		if not character then return end
+		local player = game:GetService("Players"):GetPlayerFromCharacter(character)
+		if not player then
+			-- Try vehicle occupant path
+			local vehicleSeat = character:FindFirstChildOfClass("VehicleSeat")
+			if vehicleSeat and vehicleSeat.Occupant then
+				player = game:GetService("Players"):GetPlayerFromCharacter(vehicleSeat.Occupant.Parent)
+			end
+		end
+		if not player then return end
+		local studValueObj = (partOrModel:IsA("Model") and partOrModel:FindFirstChild("StudValue") or partOrModel:FindFirstChild("StudValue"))
+		local value = studValueObj and studValueObj.Value or 1
+		touchedDebounce = true
+		PlayerManager.AddBits(player, value)
+		-- Collect sound
+		local sfx = SoundsFolder and SoundsFolder:FindFirstChild("StudCollect")
+		if sfx and sfx:IsA("Sound") then
+			local s = sfx:Clone()
+			local parentPart = (player.Character and player.Character:FindFirstChild("HumanoidRootPart")) or Workspace
+			s.Parent = parentPart
+			s:Play()
+			Debris:AddItem(s, 3)
+		end
+		if GameConfig.DEV_MODE then print(string.format("[ResourceManager] %s collected %d Bits", player.Name, value)) end
+		if partOrModel:IsA("Model") then partOrModel:Destroy() else partOrModel:Destroy() end
+	end)
+end
+
+local denominations = {100, 50, 25, 10, 5, 1}
+
+-- Centralized stud physics updater (avoids per-stud loops)
+-- Map root part -> unlockAt time (when magnet starts)
+local activeStuds = {}
+local function trackStud(root)
+	if not root then return end
+	activeStuds[root] = os.clock() + 0.6 -- delay 0.6s before suction starts
+	root.Destroying:Connect(function()
+		activeStuds[root] = nil
+	end)
+end
+
+function ResourceManager:SpawnStuds(position, amount, lifetimeSeconds)
+	if amount <= 0 then return end
+    -- Performance: limit number of pieces to 32 (same as plants), adjust per-piece value
+    local pieces = 32
+    local per = math.max(1, math.floor(amount / pieces))
+    local remainder = math.max(0, amount - per * pieces)
+    local prefab = getStudPrefab()
+    for i = 1, pieces do
+        local value = per + ((i == pieces) and remainder or 0)
+        local inst
+        if prefab then
+            inst = prefab:Clone()
+            if inst:IsA("Model") and not inst.PrimaryPart then
+                local base = inst:FindFirstChildWhichIsA("BasePart")
+                if base then inst.PrimaryPart = base end
+            end
+        else
+            inst = createFallbackStud()
+        end
+        if inst:IsA("Model") then
+            if inst.PrimaryPart then
+                inst:PivotTo(CFrame.new(position) * CFrame.new(math.random(-3,3), 1.6, math.random(-3,3)))
+                inst.Parent = Workspace
+                attachValue(inst, value)
+                hookPickup(inst)
+                inst.PrimaryPart:SetNetworkOwnershipAuto()
+                inst.PrimaryPart.AssemblyLinearVelocity = Vector3.new(math.random(-14,14), math.random(16,24), math.random(-14,14))
+            end
+        else
+            inst.CFrame = CFrame.new(position) * CFrame.new(math.random(-3,3), 1.6, math.random(-3,3))
+            inst.Parent = Workspace
+            attachValue(inst, value)
+            hookPickup(inst)
+            inst:SetNetworkOwnershipAuto()
+            inst.AssemblyLinearVelocity = Vector3.new(math.random(-14,14), math.random(16,24), math.random(-14,14))
+        end
+        local root = inst:IsA("Model") and inst.PrimaryPart or inst
+        if root and root:IsA("BasePart") then
+            root.Anchored = false
+            root.CanCollide = true
+            root.AssemblyLinearVelocity = root.AssemblyLinearVelocity + Vector3.new(math.random(-8,8), math.random(6,10), math.random(-8,8))
+            root.AssemblyAngularVelocity = Vector3.new(0, math.rad(360), 0)
+            trackStud(root)
+        end
+        Debris:AddItem(inst, lifetimeSeconds or 20)
+    end
+end
+
+-- Spawn a fixed number of studs (pieces), splitting value evenly (for plants/rocks)
+local function spawnStudPieces(position, totalAmount, pieces, lifetimeSeconds)
+	pieces = 32 -- Always 32 studs per cluster
+	local per = math.max(1, math.floor(totalAmount / pieces))
+	local remainder = math.max(0, totalAmount - per * pieces)
+	local prefab = getStudPrefab()
+	for i = 1, pieces do
+		local value = per + ((i == pieces) and remainder or 0)
+		local inst
+		if prefab then
+			inst = prefab:Clone()
+			if inst:IsA("Model") and not inst.PrimaryPart then
+				local base = inst:FindFirstChildWhichIsA("BasePart")
+				if base then inst.PrimaryPart = base end
+			end
+		else
+			inst = createFallbackStud()
+		end
+		if inst:IsA("Model") then
+			if inst.PrimaryPart then
+				inst:PivotTo(CFrame.new(position) * CFrame.new(math.random(-4,4), 1.8, math.random(-4,4)))
+				inst.Parent = Workspace
+				attachValue(inst, value)
+				hookPickup(inst)
+				local root = inst.PrimaryPart
+				root.Anchored = false; root.CanCollide = true
+				-- More energetic fly out
+				root.AssemblyLinearVelocity = Vector3.new(math.random(-18,18), math.random(18,28), math.random(-18,18))
+				root.AssemblyAngularVelocity = Vector3.new(math.random(-2,2), math.rad(180), math.random(-2,2))
+				trackStud(root)
+			end
+		else
+			local root = inst
+			root.CFrame = CFrame.new(position) * CFrame.new(math.random(-4,4), 1.8, math.random(-4,4))
+			root.Parent = Workspace
+			attachValue(inst, value)
+			hookPickup(inst)
+			root.Anchored = false; root.CanCollide = true
+			root.AssemblyLinearVelocity = Vector3.new(math.random(-18,18), math.random(18,28), math.random(-18,18))
+			root.AssemblyAngularVelocity = Vector3.new(math.random(-2,2), math.rad(180), math.random(-2,2))
+			trackStud(root)
+		end
+		Debris:AddItem(inst, lifetimeSeconds or 15)
+	end
+end
+
+-- Runtime resource proximity + projectile reaction
+local resourceNames = {
+	DeadBush = true,
+	Round_Rock_1 = true,
+	Round_Rock_2 = true,
+	Stone_1 = true,
+	Stone_2 = true,
+}
+
+local trackedResources = {}
+
+local function isResourceInstance(inst)
+	return resourceNames[inst.Name] == true
+end
+
+local function getModelRoot(inst)
+	if inst:IsA("Model") then return inst end
+	local m = inst:FindFirstAncestorOfClass("Model")
+	return m
+end
+
+local function attachResourceHooks(model)
+	if trackedResources[model] then return end
+	trackedResources[model] = true
+
+	-- Touch detection for projectiles
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+            part.Touched:Connect(function(hit)
+				if not model.Parent then return end
+				if hit.Name == "SpeederLaser" then
+                    if model:GetAttribute("RM_Destroying") then return end
+					model:SetAttribute("RM_Destroying", true)
+					local cid = model:GetAttribute("RM_ClusterId")
+					if cid and clusterState[cid] and not clusterState[cid].dropped then
+						clusterState[cid].dropped = true
+						local total = clusterState[cid].total
+						-- Play buildingexplosion sound
+						local sfx = SoundsFolder and SoundsFolder:FindFirstChild("BuildingExplosion")
+						if sfx and sfx:IsA("Sound") then
+							local s = sfx:Clone()
+							s.Parent = model.PrimaryPart or model
+							s:Play()
+							Debris:AddItem(s, 5)
+						end
+						spawnStudPieces(clusterState[cid].pos, total, 32, 15)
+					end
+					-- unanchor gently, fade, then despawn after 0.6s
+					for _, p in ipairs(model:GetDescendants()) do if p:IsA("BasePart") then p.Anchored = false; p.CanCollide = true; p.Transparency = 0.25 end end
+                    task.delay(1.7, function() if model and model.Parent then model:Destroy() end end)
+				end
+			end)
+		end
+	end
+end
+
+function ResourceManager:Init()
+	-- Hook existing
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if isResourceInstance(inst) then
+			local m = getModelRoot(inst)
+			if m then attachResourceHooks(m) end
+		end
+	end
+	-- Hook new spawns
+	Workspace.DescendantAdded:Connect(function(inst)
+		if isResourceInstance(inst) then
+			local m = getModelRoot(inst)
+			if m then attachResourceHooks(m) end
+		end
+	end)
+
+	-- Proximity detonation near speeders/vehicles
+	RunService.Heartbeat:Connect(function()
+		if not SpeederManager or not SpeederManager.GetActiveSpeedersList then return end
+		local speeders = SpeederManager:GetActiveSpeedersList()
+		for model, _ in pairs(trackedResources) do
+			if model and model.Parent then
+				local pos = model:GetPivot().Position
+				for _, sp in ipairs(speeders) do
+					if sp and sp.Parent and sp.PrimaryPart then
+						if (sp.PrimaryPart.Position - pos).Magnitude < 25 then
+							if model:GetAttribute("RM_Destroying") then break end
+							model:SetAttribute("RM_Destroying", true)
+							local cid = model:GetAttribute("RM_ClusterId")
+							if cid and clusterState[cid] and not clusterState[cid].dropped then
+								clusterState[cid].dropped = true
+								local total = clusterState[cid].total
+								-- Play buildingexplosion sound
+								local sfx = SoundsFolder and SoundsFolder:FindFirstChild("BuildingExplosion")
+								if sfx and sfx:IsA("Sound") then
+									local s = sfx:Clone()
+									s.Parent = model.PrimaryPart or model
+									s:Play()
+									Debris:AddItem(s, 5)
+								end
+								spawnStudPieces(clusterState[cid].pos, total, 32, 15)
+							end
+							-- unanchor gently (no heavy impulses), then fade and despawn after 0.6s
+							for _, p in ipairs(model:GetDescendants()) do if p:IsA("BasePart") then p.Anchored = false; p.CanCollide = true; p.Transparency = 0.25 end end
+							task.delay(1.7, function() if model and model.Parent then model:Destroy() end end)
+							-- schedule respawn using unified scheduler
+							local cid2 = model:GetAttribute("RM_ClusterId")
+							if cid2 then scheduleRespawnForCluster(cid2) end
+							break
+						end
+					end
+				end
+			end
+		end
+	end)
+
+	-- Centralized magnet update (10 Hz)
+	local accum = 0
+	RunService.Heartbeat:Connect(function(dt)
+		accum += dt
+		if accum < 0.1 then return end
+		accum = 0
+		local players = game:GetService("Players"):GetPlayers()
+		local hrps = {}
+		for _, plr in ipairs(players) do
+			local char = plr.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			if hrp then table.insert(hrps, hrp) end
+		end
+		local now = os.clock()
+		for root, unlockAt in pairs(activeStuds) do
+			if not (root and root.Parent) then activeStuds[root] = nil else
+				if now < (unlockAt or 0) then
+					-- pre-collection phase: keep them hovering and spinning
+					root.AssemblyLinearVelocity = Vector3.new(0, 2.5 + math.sin(now*2 + root.Position.X)*0.5, 0)
+					root.AssemblyAngularVelocity = Vector3.new(0, math.rad(360), 0)
+					continue
+				end
+				local nearest, dist = nil, 45
+				local rpos = root.Position
+				for _, h in ipairs(hrps) do
+					local d = (h.Position - rpos).Magnitude
+					if d < dist then dist = d; nearest = h end
+				end
+				if nearest then
+					local dir = (nearest.Position - rpos)
+					local v = dir.Magnitude > 0 and dir.Unit or Vector3.new()
+					local targetVel = v * 140 + Vector3.new(0, 10, 0)
+					-- simple smoothing
+					local lv = root.AssemblyLinearVelocity
+					root.AssemblyLinearVelocity = lv:Lerp(targetVel, 0.78)
+					root.AssemblyAngularVelocity = Vector3.new(0, math.rad(360), 0)
+				else
+					-- gentle damping and visible hover
+					root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.9 + Vector3.new(0, 3 + math.sin(now*2 + root.Position.X)*0.5, 0)
+					root.AssemblyAngularVelocity = Vector3.new(0, math.rad(360), 0)
+				end
+			end
+		end
+	end)
+
+	-- Spawner watchdog: every 2s ensure each spawner has a cluster; if not, spawn after 10s empty
+	task.spawn(function()
+		while true do
+			task.wait(2)
+			local map = Workspace:FindFirstChild("Ryloth")
+			local cfFolder = map and map:FindFirstChild("Cluster_Folder")
+			if not cfFolder then continue end
+			for _, sp in ipairs(cfFolder:GetChildren()) do
+				if sp:IsA("BasePart") then
+					local has = false
+					for _, info in pairs(clusterState) do
+						if info and info.spawner == sp then has = true; break end
+					end
+					if has then
+						spawnerEmptySince[sp] = nil
+					else
+						if not spawnerPending[sp] then
+							local now = os.clock()
+							if not spawnerEmptySince[sp] then
+								spawnerEmptySince[sp] = now
+							elseif now - spawnerEmptySince[sp] >= 10 then
+								ResourceManager:SpawnClusterAt(sp)
+								spawnerEmptySince[sp] = nil
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+return ResourceManager
