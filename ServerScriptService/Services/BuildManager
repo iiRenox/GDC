@@ -16,6 +16,7 @@ local okTesla, TeslaService = pcall(require, script.Parent:FindFirstChild("Tesla
 local okShield, ShieldService = pcall(require, script.Parent:FindFirstChild("ShieldService"))
 local okRayShield, RayShieldService = pcall(require, script.Parent:FindFirstChild("RayShieldService"))
 local okAir, AirSupportService = pcall(require, script.Parent:FindFirstChild("AirSupportService"))
+local okCannon, ProtonCannonService = pcall(require, script.Parent:FindFirstChild("ProtonCannonService"))
 local PlayerManager = require(script.Parent:WaitForChild("PlayerManager"))
 
 local BuildManager = {}
@@ -930,6 +931,11 @@ local function setupBuilding(core, plot)
 		-- Support buildings that spawn vehicles on call
 		if string.find(model.Name, "Support_Air") or string.find(model.Name, "Support_SmallAir") then
 			AirSupportService:Register(core.id, plot, model, core.ownerTeam)
+		end
+	end
+	if okCannon and ProtonCannonService then
+		if string.find(model.Name, "ProtonCannon") then
+			ProtonCannonService:RegisterCannon(model, model:GetAttribute("OwnerTeam"))
 		end
 	end
 end

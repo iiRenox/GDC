@@ -17,6 +17,8 @@ local BuildManager = require(ServerScriptService.Services:WaitForChild("BuildMan
 local WinService = require(ServerScriptService.Services:WaitForChild("WinService"))
 local MinimapService = require(ServerScriptService.Services:WaitForChild("MinimapService"))
 local okRM, ResourceManager = pcall(require, ServerScriptService.Services:WaitForChild("ResourceManager"))
+local okTS, TeslaService = pcall(require, ServerScriptService.Services:WaitForChild("TeslaService"))
+local okPC, ProtonCannonService = pcall(require, ServerScriptService.Services:WaitForChild("ProtonCannonService"))
 
 -- [Team-Erstellung bleibt unverändert]
 print("GameManager: Erstelle Teams...")
@@ -31,6 +33,8 @@ BuildManager:Init()
 if WinService and WinService.Init then WinService:Init() end
 if MinimapService and MinimapService.Init then MinimapService:Init() end
 if okRM and ResourceManager and ResourceManager.Init then ResourceManager:Init(); ResourceManager:ScatterResources() end
+if okTS and TeslaService and TeslaService.Init then TeslaService:Init() end
+if okPC and ProtonCannonService and ProtonCannonService.Init then ProtonCannonService:Init() end
 
 local mapFolder = Workspace:WaitForChild("Ryloth", 15)
 if not mapFolder then error("FATAL: Ryloth Map-Ordner nicht im Workspace gefunden!") end

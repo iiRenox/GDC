@@ -1,107 +1,218 @@
 -- File: ReplicatedStorage/Modules/HeartSystem.lua
--- Modified/Created by: GPT-5 (Cursor) — 2025-08-09
--- Based on: New module
--- Summary: Multi-stage heart system with stun and callbacks.
+-- Summary: Manages the multi-stage health, damage, and destruction of all game units.
 
 local HeartSystem = {}
+HeartSystem.__index = HeartSystem
 
-local units = {}
-local listeners = { StageTransition = {}, Destroyed = {} }
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
+local Debris = game:GetService("Debris")
 
-local function emit(eventName, ...)
-    for _, cb in ipairs(listeners[eventName]) do
-        task.spawn(cb, ...)
-    end
-end
-
-function HeartSystem:On(eventName, callback)
-    if listeners[eventName] then table.insert(listeners[eventName], callback) end
-end
-
-function HeartSystem:RegisterUnit(unitId: string, initial)
-    units[unitId] = {
-        stage2 = initial.stage2 or 0,
-        stage1 = initial.stage1 or 0,
-        normal = initial.normal or 0,
-        purple = initial.purple or 0,
-        currentStage = initial.currentStage or (initial.purple and initial.purple > 0 and "purple") or (initial.stage2 and initial.stage2 > 0 and "stage2") or (initial.stage1 and initial.stage1 > 0 and "stage1") or "normal",
-        stunnedUntil = 0,
+--[[
+    Private data store for all registered units.
+    Structure:
+    {
+        [unitId] = {
+            instance = Instance,
+            hearts = {
+                purple = number,
+                stage2 = number,
+                stage1 = number,
+                normal = number,
+            },
+            initialCounts = { ... }, -- To calculate percentages
+            currentStage = "purple" | "stage2" | "stage1" | "normal",
+            isAlive = true,
+            isStunned = false,
+        }
     }
+]]
+local units = {}
+
+-- Simple event dispatcher
+local eventListeners = {
+    StageTransition = {},
+    Destroyed = {},
+    Stunned = {},
+}
+
+function HeartSystem.On(eventName, callback)
+    if eventListeners[eventName] then
+        table.insert(eventListeners[eventName], callback)
+    else
+        warn("[HeartSystem] Attempted to subscribe to a non-existent event:", eventName)
+    end
 end
 
-function HeartSystem:IsAlive(unitId)
-    local u = units[unitId]
-    if not u then return false end
-    if u.currentStage == "normal" then return u.normal > 0 end
-    if u.currentStage == "stage1" then return u.stage1 > 0 or u.normal > 0 end
-    if u.currentStage == "stage2" then return u.stage2 > 0 or u.stage1 > 0 or u.normal > 0 end
-    if u.currentStage == "purple" then return u.purple > 0 end
-    return false
+local function fireEvent(eventName, ...)
+    if eventListeners[eventName] then
+        for _, callback in ipairs(eventListeners[eventName]) do
+            -- Use task.spawn to prevent one listener's error from stopping others
+            task.spawn(callback, ...)
+        end
+    end
 end
 
-function HeartSystem:GetHealthPercent(unitId)
-    local u = units[unitId]
-    if not u then return 0 end
-    local total, current = 0, 0
-    total += u.purple or 0; current += u.purple or 0
-    total += u.stage2 or 0; current += u.stage2 or 0
-    total += u.stage1 or 0; current += u.stage1 or 0
-    total += u.normal or 0; current += u.normal or 0
-    if total <= 0 then return 0 end
-    return math.clamp((current/total) * 100, 0, 100)
+local function applyStun(unitData)
+    if unitData.isStunned then return end
+    unitData.isStunned = true
+    fireEvent("Stunned", unitData.id, true)
+
+    task.delay(GameConfig.DEFAULTS.STUN_DURATION, function()
+        -- Ensure the unit still exists and hasn't been destroyed
+        if units[unitData.id] and units[unitData.id].isAlive then
+            units[unitData.id].isStunned = false
+            fireEvent("Stunned", unitData.id, false)
+        end
+    end)
 end
 
-function HeartSystem:ForceTransition(unitId, newStage: string)
-    local u = units[unitId]
-    if not u then return end
-    u.currentStage = newStage
-    emit("StageTransition", unitId, newStage)
+local function handleDestruction(unitData, attacker)
+    unitData.isAlive = false
+    fireEvent("Destroyed", unitData.id, attacker)
+    -- Clean up the unit from the system after a delay to allow listeners to react
+    task.delay(5, function()
+        if units[unitData.id] == unitData then
+            units[unitData.id] = nil
+        end
+    end)
 end
 
-function HeartSystem:TakeHit(unitId, damageType: string, attacker)
-    local u = units[unitId]
-    if not u then return end
-    local now = os.clock()
-    if now < (u.stunnedUntil or 0) then return end
+-- Public API Methods
 
-    local function applyStun()
-        local GameConfig = require(game:GetService("ReplicatedStorage"):WaitForChild("GameConfig"))
-        local dur = (GameConfig.DEFAULTS and GameConfig.DEFAULTS.STUN_DURATION) or 2
-        u.stunnedUntil = now + dur
-        return dur
+function HeartSystem.RegisterUnit(unitId, initialStagesTable, instance)
+    if not unitId or not initialStagesTable then
+        warn("[HeartSystem] RegisterUnit failed: invalid unitId or initialStagesTable.")
+        return
     end
 
-    local stage = u.currentStage
-    if stage == "purple" then
-        u.purple = math.max(0, (u.purple or 0) - 1)
-        if u.purple <= 0 then
-            emit("Destroyed", unitId, attacker)
-        end
+    local hearts = {
+        purple = initialStagesTable.purple or 0,
+        stage2 = initialStagesTable.stage2 or 0,
+        stage1 = initialStagesTable.stage1 or 0,
+        normal = initialStagesTable.normal or 0,
+    }
+
+    local currentStage
+    if hearts.purple > 0 then currentStage = "purple"
+    elseif hearts.stage2 > 0 then currentStage = "stage2"
+    elseif hearts.stage1 > 0 then currentStage = "stage1"
+    elseif hearts.normal > 0 then currentStage = "normal"
+    else
+        warn("[HeartSystem] RegisterUnit failed: unit has no hearts.", unitId)
         return
-    elseif stage == "stage2" then
-        u.stage2 = math.max(0, (u.stage2 or 0) - 1)
-        if u.stage2 <= 0 then
-            local dur = applyStun()
-            u.currentStage = "stage1"
-            emit("StageTransition", unitId, "stage1", dur)
-        end
+    end
+
+    units[unitId] = {
+        id = unitId,
+        instance = instance,
+        hearts = hearts,
+        initialCounts = table.clone(hearts),
+        currentStage = currentStage,
+        isAlive = true,
+        isStunned = false,
+    }
+    --print("[HeartSystem] Registered unit:", unitId, "with stage", currentStage)
+end
+
+function HeartSystem.TakeHit(unitId, damageType, attacker)
+    local unitData = units[unitId]
+    if not unitData or not unitData.isAlive or unitData.isStunned then
         return
-    elseif stage == "stage1" then
-        u.stage1 = math.max(0, (u.stage1 or 0) - 1)
-        if u.stage1 <= 0 then
-            local dur = applyStun()
-            u.currentStage = "normal"
-            emit("StageTransition", unitId, "normal", dur)
+    end
+
+    local stage = unitData.currentStage
+    local hearts = unitData.hearts
+
+    -- Special damage type rules
+    if damageType == "Torpedo" then
+        if stage ~= "purple" then return end -- Torpedoes only damage purple hearts
+        hearts.purple -= 1
+    elseif damageType == "Tesla" then
+        -- Tesla melts through all stages without stunning
+        local stages = {"purple", "stage2", "stage1", "normal"}
+        for _, s in ipairs(stages) do
+            if hearts[s] > 0 then
+                hearts[s] -= 1
+                stage = s -- Update stage to the one that was hit
+                break
+            end
         end
-        return
-    else -- normal
-        u.normal = math.max(0, (u.normal or 0) - 1)
-        if u.normal <= 0 then
-            emit("Destroyed", unitId, attacker)
+    else
+        -- Standard damage
+        hearts[stage] -= 1
+    end
+
+    -- Check for stage transition or destruction
+    if hearts[stage] <= 0 then
+        local oldStage = stage
+        local newStage = nil
+
+        if stage == "purple" then
+            if damageType == "Torpedo" then
+                newStage = "stage2"
+                applyStun(unitData)
+            else
+                -- Destroyed by non-torpedo damage (e.g., Tesla)
+                handleDestruction(unitData, attacker)
+                return
+            end
+        elseif stage == "stage2" then
+            newStage = "stage1"
+            applyStun(unitData)
+        elseif stage == "stage1" then
+            newStage = "normal"
+            applyStun(unitData)
+        elseif stage == "normal" then
+            handleDestruction(unitData, attacker)
+            return
         end
+
+        if newStage then
+            unitData.currentStage = newStage
+            fireEvent("StageTransition", unitId, oldStage, newStage)
+        end
+    end
+end
+
+function HeartSystem.GetHealthPercent(unitId)
+    local unitData = units[unitId]
+    if not unitData then return 0 end
+
+    local currentTotal = 0
+    local initialTotal = 0
+
+    for stage, count in pairs(unitData.hearts) do
+        currentTotal += count
+    end
+    for stage, count in pairs(unitData.initialCounts) do
+        initialTotal += count
+    end
+
+    if initialTotal == 0 then return 0 end
+    return (currentTotal / initialTotal) * 100
+end
+
+function HeartSystem.IsAlive(unitId)
+    local unit = units[unitId]
+    return unit and unit.isAlive
+end
+
+function HeartSystem.GetUnitData(unitId)
+    return units[unitId]
+end
+
+function HeartSystem.ForceTransition(unitId, newStage)
+    local unitData = units[unitId]
+    if not unitData or not unitData.isAlive then return end
+
+    if unitData.hearts[newStage] and unitData.hearts[newStage] > 0 then
+        local oldStage = unitData.currentStage
+        unitData.currentStage = newStage
+        fireEvent("StageTransition", unitId, oldStage, newStage)
+    else
+        warn("[HeartSystem] ForceTransition failed: invalid or empty target stage:", newStage)
     end
 end
 
 return HeartSystem
-
-

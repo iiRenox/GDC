@@ -1,4 +1,4 @@
--- File: ServerScriptService/Services/TeslaService
+-- File: ServerScriptService/Services/TeslaService.lua
 -- Summary: Manages all Tesla tower instances, their targeting, and damage application.
 
 local TeslaService = {}
@@ -15,7 +15,7 @@ local HeartSystem = require(ReplicatedStorage.Modules.HeartSystem)
 
 local activeTeslas = {} -- { [instance] = { ownerTeam = number } }
 local lastTick = 0
-local TICK_INTERVAL = 0.5 -- seconds, for 2 hits per second, as per design docs.
+local TICK_INTERVAL = 1 -- seconds, how often Teslas check for targets
 
 -- Function to find a valid target (player, troop, or vehicle)
 local function findTarget(teslaInstance, ownerTeam)
@@ -23,6 +23,8 @@ local function findTarget(teslaInstance, ownerTeam)
     local radius = 135 -- As per "Infos" documentation
 
     local overlapParams = OverlapParams.new()
+    -- Configure filter to find things that can be damaged
+    -- This will need to be refined with CollectionService tags for troops/vehicles
     overlapParams.FilterType = Enum.RaycastFilterType.Exclude
     overlapParams.FilterDescendantsInstances = {teslaInstance}
 
@@ -32,21 +34,20 @@ local function findTarget(teslaInstance, ownerTeam)
         local model = part:FindFirstAncestorWhichIsA("Model")
         if not model then continue end
 
-        local targetTeam
-        local attrTeam = model:GetAttribute("OwnerTeam")
-        if attrTeam then
-            targetTeam = attrTeam
-        else
+        local targetTeam = model:GetAttribute("OwnerTeam")
+        if not targetTeam then
             local player = game.Players:GetPlayerFromCharacter(model)
             if player then
                 targetTeam = PlayerManager.GetTeamId(player)
             end
         end
 
+        -- Check if the target is an enemy
         if targetTeam and targetTeam ~= ownerTeam then
+            -- Check if it's a damageable entity registered in the HeartSystem
             local unitId = model:GetAttribute("UnitId")
             if unitId and HeartSystem.IsAlive(unitId) then
-                return model
+                return model -- Return the first valid enemy model found
             end
         end
     end
@@ -57,6 +58,7 @@ end
 function TeslaService:Init()
     print("[TeslaService] Initializing...")
 
+    -- Listen for when a Tesla is destroyed to remove it from the active list
     HeartSystem.On("Destroyed", function(unitId, attacker)
         for instance, data in pairs(activeTeslas) do
             if instance:GetAttribute("UnitId") == unitId then
@@ -67,18 +69,23 @@ function TeslaService:Init()
         end
     end)
 
+    -- Main update loop
     RunService.Heartbeat:Connect(function()
         if os.clock() - lastTick < TICK_INTERVAL then return end
         lastTick = os.clock()
 
         for tesla, data in pairs(activeTeslas) do
             if not tesla.Parent then
-                activeTeslas[tesla] = nil
+                activeTeslas[tesla] = nil -- Cleanup if instance was removed unexpectedly
                 continue
             end
 
             local target = findTarget(tesla, data.ownerTeam)
             if target then
+                local unitId = target:GetAttribute("UnitId")
+                -- TODO: Add a visual effect (beam) from the Tesla to the target
+
+                -- Apply damage through CombatService
                 CombatService:ApplyDamage(tesla, target, 1, "Tesla")
             end
         end
@@ -87,29 +94,26 @@ function TeslaService:Init()
     print("[TeslaService] Initialized.")
 end
 
--- This function is called by BuildManager when a Tesla is placed.
-function TeslaService:RegisterTesla(coreId, plot, teslaInstance, ownerTeam)
+function TeslaService:RegisterTesla(teslaInstance, ownerTeam)
     if not teslaInstance or not teslaInstance:IsA("Model") or not ownerTeam then
         warn("[TeslaService] Attempted to register an invalid Tesla.")
         return
     end
 
+    -- Ensure the Tesla has a unique ID for the HeartSystem
     local unitId = teslaInstance:GetAttribute("UnitId")
     if not unitId then
         unitId = "Tesla_" .. tostring(teslaInstance:GetUniqueId())
         teslaInstance:SetAttribute("UnitId", unitId)
     end
 
+    -- Register with the HeartSystem
     -- TODO: Get actual heart stages from GameConfig based on Tesla tier (Normal, Silver, Gold)
-    -- Using a placeholder for now.
-    local stats = { stage1 = 5, normal = 5 }
-    HeartSystem.RegisterUnit(unitId, stats, teslaInstance)
+    HeartSystem.RegisterUnit(unitId, { stage1 = 5, normal = 5 }, teslaInstance)
 
     activeTeslas[teslaInstance] = {
         ownerTeam = ownerTeam,
     }
-    -- Ensure the instance itself has an OwnerTeam attribute for targeting checks
-    teslaInstance:SetAttribute("OwnerTeam", ownerTeam)
     print("[TeslaService] Registered new Tesla:", teslaInstance.Name, "for team", ownerTeam)
 end
 
