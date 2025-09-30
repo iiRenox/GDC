@@ -196,75 +196,91 @@ function CombatService:HandleRangedAttack(player, originCFrame, attackType)
 end
 
 
+local PlayerManager = require(script.Parent:WaitForChild("PlayerManager"))
+
 function CombatService:ApplyDamage(source, target, damage, damageType)
-    -- Tiered building handling
     local model = target
-    if typeof(target) == "Instance" then
-        local m = target:FindFirstAncestorWhichIsA("Model") or (target:IsA("Model") and target)
-        if m then model = m end
+    if typeof(target) == "Instance" and not target:IsA("Model") then
+        model = target:FindFirstAncestorWhichIsA("Model")
     end
+
+    if not (model and model:IsA("Model")) then return end
+
     -- Global shield checks (apply to any model target)
-    if typeof(model) == "Instance" and model:IsA("Model") then
-        if okRayShield and RayShieldService and model:GetAttribute("IsBuilding") and RayShieldService:IsShielded(model) then return end
-        if okShield and ShieldService and ShieldService:IsBlocked(source, model, damageType) then return end
+    if okRayShield and RayShieldService and model:GetAttribute("IsBuilding") and RayShieldService:IsShielded(model) then return end
+    if okShield and ShieldService and ShieldService:IsBlocked(source, model, damageType) then return end
+
+    -- NEW: Prioritize HeartSystem for any registered unit
+    local unitId = model:GetAttribute("UnitId")
+    if unitId and HeartSystem.IsAlive(unitId) then
+        -- Friendly fire check
+        local targetTeam = model:GetAttribute("OwnerTeam")
+        local attackerTeam = nil
+
+        local attackerPlayer = Players:GetPlayerFromCharacter(source) or (source:IsA("Model") and Players:GetPlayerFromCharacter(source:FindFirstChildOfClass("Humanoid")))
+        if attackerPlayer then
+            attackerTeam = PlayerManager.GetTeamId(attackerPlayer)
+        elseif source:IsA("Model") then
+            attackerTeam = source:GetAttribute("OwnerTeam")
+        end
+
+        if targetTeam and attackerTeam and targetTeam == attackerTeam then
+            return -- Friendly fire detected
+        end
+
+        HeartSystem:TakeHit(unitId, damageType, source)
+        return -- Handled by HeartSystem, no further processing needed.
     end
-    -- Humanoid friendly-fire guard for generic calls
-    if typeof(model) == "Instance" and model:IsA("Model") then
-        local hum = model:FindFirstChildOfClass("Humanoid")
-        if hum then
-            local atkPlr = nil
-            if typeof(source) == "Instance" then
-                atkPlr = game:GetService("Players"):GetPlayerFromCharacter(source) or game:GetService("Players"):GetPlayerFromCharacter(source:FindFirstAncestorWhichIsA("Model"))
+
+    -- LEGACY LOGIC BELOW (for units not using HeartSystem)
+
+    -- Humanoid friendly-fire guard
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local atkPlr = Players:GetPlayerFromCharacter(source) or Players:GetPlayerFromCharacter(source:FindFirstAncestorWhichIsA("Model"))
+        local tgtPlr = Players:GetPlayerFromCharacter(model)
+        if atkPlr and tgtPlr then
+            local a = playerTeamId(atkPlr)
+            local b = playerTeamId(tgtPlr)
+            if a and b and a == b then return end
+        end
+        hum:TakeDamage(damage or 1)
+        return
+    end
+
+    -- Legacy building health logic
+    local hv = model:FindFirstChild("Health")
+    if hv and hv:IsA("IntValue") then
+        -- Prevent friendly-fire vs buildings
+        if model:GetAttribute("IsBuilding") then
+            local ownerTid = model:GetAttribute("OwnerTeam")
+            if not ownerTid and typeof(model.Name) == "string" then
+                if model.Name:find("CIS") then ownerTid = GameConfig.TEAM.CIS
+                elseif model.Name:find("Rep") then ownerTid = GameConfig.TEAM.REP end
             end
-            local tgtPlr = game:GetService("Players"):GetPlayerFromCharacter(model)
-            if atkPlr and tgtPlr then
-                local a = playerTeamId(atkPlr)
-                local b = playerTeamId(tgtPlr)
-                if a and b and a == b then return end
+            local atkTid
+            local plr = Players:GetPlayerFromCharacter(source) or Players:GetPlayerFromCharacter(source:FindFirstAncestorWhichIsA("Model"))
+            if plr then atkTid = playerTeamId(plr) end
+            if ownerTid and atkTid and ownerTid == atkTid then return end
+        end
+
+        -- Tesla never damages buildings (legacy check)
+        if damageType == DamageType.Tesla and model:GetAttribute("IsBuilding") then return end
+
+        -- Laser: silver immune; gold tracks exposure melt; others take damage
+        if damageType == DamageType.Laser and isLaserImmune(model) then
+            if getBuildingTier(model) == "Gold" and source then
+                trackLaserExposure(model, tostring(source))
             end
-            -- Otherwise, apply raw health damage
-            hum:TakeDamage(damage or 1)
             return
         end
-    end
-    if typeof(model) == "Instance" and model:IsA("Model") then
-        local hv = model:FindFirstChild("Health")
-        if hv and hv:IsA("IntValue") then
-            -- Prevent friendly-fire vs buildings (server-side guard)
-            if model:GetAttribute("IsBuilding") then
-                local ownerTid = model:GetAttribute("OwnerTeam")
-                -- Fallback: infer team from model name if attribute missing
-                if not ownerTid and typeof(model.Name) == "string" then
-                    local n = model.Name
-                    if n:find("CIS") then ownerTid = GameConfig.TEAM.CIS
-                    elseif n:find("Rep") then ownerTid = GameConfig.TEAM.REP end
-                end
-                local atkTid = nil
-                if typeof(source) == "Instance" then
-                    local plr = game:GetService("Players"):GetPlayerFromCharacter(source) or game:GetService("Players"):GetPlayerFromCharacter(source:FindFirstAncestorWhichIsA("Model"))
-                    atkTid = playerTeamId(plr)
-                elseif type(source) == "string" or type(source) == "number" then
-                    -- unknown source type; skip team check
-                end
-                if ownerTid and atkTid and ownerTid == atkTid then return end
-            end
-            -- Tesla never damages buildings
-            if damageType == DamageType.Tesla then return end
-            -- Laser: silver immune; gold tracks exposure melt; others take damage
-            if damageType == DamageType.Laser and isLaserImmune(model) then
-                if getBuildingTier(model) == "Gold" and source then
-                    trackLaserExposure(model, tostring(source))
-                end
-                return
-            end
-            if damageType == DamageType.Beam then
-                if isBeamImmune(model) then return end -- Silver immune to beam
-                if getBuildingTier(model) == "Gold" then trackBeamExposure(model); return end
-            end
-            if damageType == DamageType.HighImpact and isHighImpactImmune(model) then return end
-            hv.Value = math.max(0, hv.Value - (damage or 1))
-            return
+        if damageType == DamageType.Beam then
+            if isBeamImmune(model) then return end -- Silver immune to beam
+            if getBuildingTier(model) == "Gold" then trackBeamExposure(model); return end
         end
+        if damageType == DamageType.HighImpact and isHighImpactImmune(model) then return end
+
+        hv.Value = math.max(0, hv.Value - (damage or 1))
     end
 end
 
