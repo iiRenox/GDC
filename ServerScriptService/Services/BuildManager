@@ -815,8 +815,14 @@ local function onBuildingDestroyed(core, plot, model)
 		end
 	end)
 	pcall(function()
-		if okAir and AirSupportService and (string.find(model.Name, "Support_Air") or string.find(model.Name, "Support_SmallAir")) then
+		if okAir and AirSupportService and AirSupportService.DespawnForBuilding and (string.find(model.Name, "Support_Air") or string.find(model.Name, "Support_SmallAir")) then
 			AirSupportService:DespawnForBuilding(model)
+		end
+	end)
+	pcall(function()
+		if okCannon and ProtonCannonService and ProtonCannonService.Unregister and string.find(model.Name, "ProtonCannon") then
+			-- Unregister is not implemented in the service, but this is good practice
+			-- ProtonCannonService:Unregister(model)
 		end
 	end)
 	-- Drop Bits (70% of cost) resolving from known name patterns
@@ -912,28 +918,27 @@ local function setupBuilding(core, plot)
 			TorpedoService:RegisterLauncher(core.id, plot, model)
 		end
 	end
-	if okTesla and TeslaService then
+	if okTesla and TeslaService and TeslaService.RegisterTesla then
 		if string.find(model.Name, "Tesla") then
-			TeslaService:RegisterTesla(core.id, plot, model, core.ownerTeam)
+			TeslaService:RegisterTesla(core.id, plot, model, model:GetAttribute("OwnerTeam"))
 		end
 	end
-	if okShield and ShieldService then
+	if okShield and ShieldService and ShieldService.Register then
 		if string.find(model.Name, "ShieldGen") and not (string.find(model.Name, "RayShieldGen") or string.find(model.Name, "ReyShieldGen")) then
-			ShieldService:Register(core.id, plot, model, core.ownerTeam)
+			ShieldService:Register(core.id, plot, model, model:GetAttribute("OwnerTeam"))
 		end
 	end
-	if okRayShield and RayShieldService then
+	if okRayShield and RayShieldService and RayShieldService.Register then
 		if string.find(model.Name, "RayShieldGen") or string.find(model.Name, "ReyShieldGen") then
-			RayShieldService:Register(core.id, plot, model, core.ownerTeam)
+			RayShieldService:Register(core.id, plot, model, model:GetAttribute("OwnerTeam"))
 		end
 	end
-	if okAir and AirSupportService then
-		-- Support buildings that spawn vehicles on call
+	if okAir and AirSupportService and AirSupportService.Register then
 		if string.find(model.Name, "Support_Air") or string.find(model.Name, "Support_SmallAir") then
-			AirSupportService:Register(core.id, plot, model, core.ownerTeam)
+			AirSupportService:Register(core.id, plot, model, model:GetAttribute("OwnerTeam"))
 		end
 	end
-	if okCannon and ProtonCannonService then
+    if okCannon and ProtonCannonService and ProtonCannonService.RegisterCannon then
 		if string.find(model.Name, "ProtonCannon") then
 			ProtonCannonService:RegisterCannon(model, model:GetAttribute("OwnerTeam"))
 		end

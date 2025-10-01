@@ -1,116 +1,78 @@
 -- File: ServerScriptService/Services/TeslaService
--- Summary: Manages all Tesla tower instances, their targeting, and damage application.
+-- Modified/Created by: GPT-5 (Cursor) — 2025-08-09
+-- Summary: Tesla aura that damages only enemy units/vehicles, never buildings. Visual bolts optional later.
+
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
 
 local TeslaService = {}
 
-local ServerScriptService = game:GetService("ServerScriptService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local CollectionService = game:GetService("CollectionService")
+local activeTeslas = {}
+local AURA_RADIUS = 135
+local TICK = 0.25 -- 4 Hz
+local DPS = 6 -- tune
 
-local GameConfig = require(ReplicatedStorage:WaitForChild("GameConfig"))
-local CombatService = require(ServerScriptService.Services:WaitForChild("CombatService"))
-local PlayerManager = require(ServerScriptService.Services:WaitForChild("PlayerManager"))
-local HeartSystem = require(ReplicatedStorage.Modules.HeartSystem)
+function TeslaService:RegisterTesla(coreId: string, plot, model: Model, ownerTeam)
+    activeTeslas[model] = { coreId = coreId, plot = plot, model = model, ownerTeam = ownerTeam }
+    model.Destroying:Connect(function() activeTeslas[model] = nil end)
+end
 
-local activeTeslas = {} -- { [instance] = { ownerTeam = number } }
-local lastTick = 0
-local TICK_INTERVAL = 0.5 -- seconds, for 2 hits per second, as per design docs.
-
--- Function to find a valid target (player, troop, or vehicle)
-local function findTarget(teslaInstance, ownerTeam)
-    local position = teslaInstance.PrimaryPart.Position
-    local radius = 135 -- As per "Infos" documentation
-
-    local overlapParams = OverlapParams.new()
-    overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-    overlapParams.FilterDescendantsInstances = {teslaInstance}
-
-    local partsInRadius = workspace:GetPartBoundsInRadius(position, radius, overlapParams)
-
-    for _, part in ipairs(partsInRadius) do
-        local model = part:FindFirstAncestorWhichIsA("Model")
-        if not model then continue end
-
-        local targetTeam
-        local attrTeam = model:GetAttribute("OwnerTeam")
-        if attrTeam then
-            targetTeam = attrTeam
-        else
-            local player = game.Players:GetPlayerFromCharacter(model)
-            if player then
-                targetTeam = PlayerManager.GetTeamId(player)
-            end
-        end
-
-        if targetTeam and targetTeam ~= ownerTeam then
-            local unitId = model:GetAttribute("UnitId")
-            if unitId and HeartSystem.IsAlive(unitId) then
-                return model
+local accumulated = 0
+RunService.Heartbeat:Connect(function(dt)
+    accumulated += dt
+    if accumulated < TICK then return end
+    accumulated = 0
+    for m, info in pairs(activeTeslas) do
+        if not (m and m.Parent) then activeTeslas[m] = nil else
+            local center = (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart"))
+            if center then
+                for _, inst in ipairs(Workspace:GetDescendants()) do
+                    if inst:IsA("Model") then
+                        -- skip buildings
+                        if inst:GetAttribute("IsBuilding") then continue end
+                        -- basic team check by player Team for characters; vehicles: infer by proximity/owner if needed later
+                        local hum = inst:FindFirstChildOfClass("Humanoid")
+                        local root = inst:FindFirstChild("HumanoidRootPart") or inst.PrimaryPart
+                        if root then
+                            local dist = (root.Position - center.Position).Magnitude
+                            if dist <= AURA_RADIUS then
+                                -- team filter: if character has a Player with team equal to ownerTeam, skip
+                                local okHit = true
+                                if hum then
+                                    local plr = game:GetService("Players"):GetPlayerFromCharacter(inst)
+                                    if plr and plr.Team then
+                                        local repName = GameConfig.Teams[2].Name
+                                        local cisName = GameConfig.Teams[1].Name
+                                        local teamId = (plr.Team.Name == repName) and GameConfig.TEAM.REP or (plr.Team.Name == cisName) and GameConfig.TEAM.CIS or nil
+                                        if teamId == info.ownerTeam then okHit = false end
+                                    end
+                                end
+                                -- vehicle/troop models: honor OwnerTeam attribute to avoid friendly fire
+                                if okHit then
+                                    local ownerTid = inst:GetAttribute("OwnerTeam")
+                                    if ownerTid and ownerTid == info.ownerTeam then okHit = false end
+                                end
+                                if okHit then
+                                    -- apply damage to humanoids or Health carriers (vehicles/units), not buildings
+                                    if hum then
+                                        hum:TakeDamage(math.max(1, math.floor(DPS * TICK)))
+                                    else
+                                        local hv = inst:FindFirstChild("Health")
+                                        if hv and hv:IsA("IntValue") then hv.Value = math.max(0, hv.Value - math.max(1, math.floor(DPS * TICK))) end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
             end
         end
     end
-
-    return nil
-end
-
-function TeslaService:Init()
-    print("[TeslaService] Initializing...")
-
-    HeartSystem.On("Destroyed", function(unitId, attacker)
-        for instance, data in pairs(activeTeslas) do
-            if instance:GetAttribute("UnitId") == unitId then
-                activeTeslas[instance] = nil
-                print("[TeslaService] Unregistered destroyed Tesla:", instance.Name)
-                break
-            end
-        end
-    end)
-
-    RunService.Heartbeat:Connect(function()
-        if os.clock() - lastTick < TICK_INTERVAL then return end
-        lastTick = os.clock()
-
-        for tesla, data in pairs(activeTeslas) do
-            if not tesla.Parent then
-                activeTeslas[tesla] = nil
-                continue
-            end
-
-            local target = findTarget(tesla, data.ownerTeam)
-            if target then
-                CombatService:ApplyDamage(tesla, target, 1, "Tesla")
-            end
-        end
-    end)
-
-    print("[TeslaService] Initialized.")
-end
-
--- This function is called by BuildManager when a Tesla is placed.
-function TeslaService:RegisterTesla(coreId, plot, teslaInstance, ownerTeam)
-    if not teslaInstance or not teslaInstance:IsA("Model") or not ownerTeam then
-        warn("[TeslaService] Attempted to register an invalid Tesla.")
-        return
-    end
-
-    local unitId = teslaInstance:GetAttribute("UnitId")
-    if not unitId then
-        unitId = "Tesla_" .. tostring(teslaInstance:GetUniqueId())
-        teslaInstance:SetAttribute("UnitId", unitId)
-    end
-
-    -- TODO: Get actual heart stages from GameConfig based on Tesla tier (Normal, Silver, Gold)
-    -- Using a placeholder for now.
-    local stats = { stage1 = 5, normal = 5 }
-    HeartSystem.RegisterUnit(unitId, stats, teslaInstance)
-
-    activeTeslas[teslaInstance] = {
-        ownerTeam = ownerTeam,
-    }
-    -- Ensure the instance itself has an OwnerTeam attribute for targeting checks
-    teslaInstance:SetAttribute("OwnerTeam", ownerTeam)
-    print("[TeslaService] Registered new Tesla:", teslaInstance.Name, "for team", ownerTeam)
-end
+end)
 
 return TeslaService
+
+

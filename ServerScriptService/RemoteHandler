@@ -24,8 +24,6 @@ local RE = {
     TorpedoFire = RemotesFolder:FindFirstChild("RE_Torpedo_Fire"),
     RequestUnitControl = RemotesFolder:FindFirstChild("RE_RequestUnitControl"),
     PlayEffect = RemotesFolder:FindFirstChild("RE_PlayEffect"),
-    CannonUpdateInput = RemotesFolder:FindFirstChild("RE_Cannon_UpdateInput"),
-    CannonFire = RemotesFolder:FindFirstChild("RE_Cannon_Fire"),
 }
 local RF = {
     GetGameConfig = RemotesFolder:FindFirstChild("RF_GetGameConfig"),
@@ -43,8 +41,6 @@ local okBM, BuildManager = pcall(require, ServerScriptService.Services:WaitForCh
 if not okBM then BuildManager = nil end
 local okTS, TorpedoService = pcall(require, ServerScriptService.Services:WaitForChild("TorpedoService"))
 if not okTS then TorpedoService = nil end
-local okPC, ProtonCannonService = pcall(require, ServerScriptService.Services:WaitForChild("ProtonCannonService"))
-if not okPC then warn("[RemoteHandler] ProtonCannonService load failed:", ProtonCannonService) end
 
 -- Lade hier später weitere Services
 -- local success, BuildingService = pcall(require, ServerScriptService.Services:WaitForChild("BuildingService"))
@@ -126,24 +122,6 @@ if RE.TorpedoFire and TorpedoService then
         if not validPlayer(player) then return end
         if isRateLimited(player, "RE_Torpedo_Fire", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return end
         TorpedoService:Fire(player)
-    end)
-end
-
-if RE.CannonUpdateInput and ProtonCannonService then
-    RE.CannonUpdateInput.OnServerEvent:Connect(function(player, payload)
-        if not validPlayer(player) then return end
-        if isRateLimited(player, "RE_Cannon_UpdateInput", GameConfig.SPEEDER.INPUT_RATE_LIMIT) then return end
-        if payload and type(payload) == "table" then
-            ProtonCannonService:HandleInput(player, payload)
-        end
-    end)
-end
-
-if RE.CannonFire and ProtonCannonService then
-    RE.CannonFire.OnServerEvent:Connect(function(player)
-        if not validPlayer(player) then return end
-        if isRateLimited(player, "RE_Cannon_Fire", GameConfig.REMOTE_RATE_LIMITS.DEFAULT) then return end
-        ProtonCannonService:HandleFireRequest(player)
     end)
 end
 
